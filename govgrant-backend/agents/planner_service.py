@@ -2,13 +2,15 @@
 PlannerService — Real Gemini-powered report generation (Agent 4).
 
 Data flow:
-1. Reads UserProfile + RankedSchemes from DB
-2. Calls Gemini to generate:
-   - Consolidated documents checklist
+1. Reads UserProfile + RankedSchemes from DB (written by Agents 1 & 3)
+2. Calls Gemini 2.0 Flash to generate:
+   - Consolidated documents checklist (10-15 items, deduped)
    - Per-scheme action cards (steps, tips, portal links)
    - 150-word persuasive cover summary
 3. Persists to grant_reports table
-4. Returns report dict for SSE emission
+4. Returns report dict for SSE emission as report_ready event
+
+This agent owns the `grant_reports` database table.
 """
 from __future__ import annotations
 
@@ -26,6 +28,10 @@ from db.models import GrantReport, RankedScheme, UserProfile as DBUserProfile
 logger = logging.getLogger("govgrant.planner")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINT — called by pipeline in routes.py
+# ═══════════════════════════════════════════════════════════════════════════════
+
 async def run_planner(
     session_id: str,
     profile_data: Dict[str, Any],
@@ -33,19 +39,28 @@ async def run_planner(
 ) -> Dict[str, Any]:
     """
     Run Agent 4: generate full GrantReport from ranked schemes, persist to DB.
-    Returns report dict for SSE emission.
+
+    Args:
+        session_id: Current session UUID
+        profile_data: User profile dict from Agent 1
+        db: SQLModel session for DB reads/writes
+
+    Returns:
+        Report dict with documents, action_cards, cover_summary for SSE
     """
     logger.info("[%s] === PLANNER START ===", session_id)
 
-    # Read ranked schemes from DB
+    # ── Step 1: Read ranked schemes from DB (Agent 3 output) ──────────
     ranked_rows = db.exec(
         select(RankedScheme).where(RankedScheme.session_id == session_id)
         .order_by(RankedScheme.composite_rank)
     ).all()
 
     if not ranked_rows:
-        logger.warning("[%s] No ranked_schemes found — using fallback report", session_id)
-        return _fallback_report(profile_data)
+        logger.warning("[%s] No ranked_schemes found -- using fallback report", session_id)
+        report = _fallback_report(profile_data)
+        _persist_report(session_id, report, db)
+        return report
 
     ranked_schemes = [
         {
@@ -62,14 +77,26 @@ async def run_planner(
 
     logger.info("[%s] Generating report for %d ranked schemes", session_id, len(ranked_schemes))
 
-    # Call Gemini
+    # ── Step 2: Call Gemini to generate report ─────────────────────────
     report = await _gemini_generate(session_id, profile_data, ranked_schemes)
 
     if not report:
-        logger.warning("[%s] Gemini planner failed — using fallback", session_id)
+        logger.warning("[%s] Gemini planner failed -- using fallback", session_id)
         report = _fallback_report(profile_data)
 
-    # Persist to grant_reports (upsert)
+    # ── Step 3: Persist to grant_reports table ─────────────────────────
+    _persist_report(session_id, report, db)
+
+    logger.info("[%s] === PLANNER DONE === report persisted", session_id)
+    return report
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DB PERSISTENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _persist_report(session_id: str, report: Dict, db: Session) -> None:
+    """Write the report to grant_reports table (upsert)."""
     existing = db.exec(
         select(GrantReport).where(GrantReport.session_id == session_id)
     ).first()
@@ -84,58 +111,53 @@ async def run_planner(
         cover_summary=report.get("cover_summary", ""),
     ))
     db.commit()
-    logger.info("[%s] === PLANNER DONE — report persisted ===", session_id)
-    return report
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GEMINI REPORT GENERATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
 async def _gemini_generate(
     session_id: str,
     profile: Dict[str, Any],
     schemes: List[Dict],
 ) -> Optional[Dict]:
-    """Call Gemini to generate the full grant report."""
+    """Call Gemini 2.0 Flash to generate the full grant report."""
 
-    prompt = f"""You are GovGrant's report generator. Create a complete grant report for this business.
+    prompt = f"""You are GovGrant's report generator for Indian businesses.
+Create a complete, actionable grant report.
 
 BUSINESS PROFILE:
-- Name: {profile.get('name')}
-- Type: {profile.get('type')}
-- Sector: {profile.get('sector')}
-- Location: {profile.get('city', '')}, {profile.get('state')}
-- Team: {profile.get('team_size')} employees
-- Revenue: INR {profile.get('revenue_inr')}
-- Funding Purpose: {profile.get('funding_purpose')}
+- Name: {profile.get('name', 'Unknown')}
+- Type: {profile.get('type', 'Unknown')}
+- Sector: {profile.get('sector', 'Unknown')}
+- Location: {profile.get('city', '')}, {profile.get('state', 'India')}
+- Team: {profile.get('team_size', 0)} employees
+- Revenue: INR {profile.get('revenue_inr', 0):,}
+- Funding Purpose: {profile.get('funding_purpose', 'general')}
 
 TOP MATCHED SCHEMES:
 {json.dumps(schemes, indent=2)}
 
-Generate a JSON object with EXACTLY these three keys:
+Generate a JSON object with EXACTLY these 3 keys:
 
-1. "documents" - Array of document objects, each with:
-   - "name": string (document name)
-   - "mandatory": boolean
-   - "notes": string (brief note on what's needed)
-   
-   Always include: Aadhaar/PAN, incorporation certificate, bank statements (6 months), ITR (2 years), GST certificate, MSME/Udyam registration, business plan.
-   Add scheme-specific documents based on the schemes above.
+1. "documents" - Array of 10-15 document objects, each with:
+   {{"name": "string", "mandatory": true/false, "description": "what's needed"}}
+
+   Always include: Aadhaar/PAN, incorporation cert, bank statements (6mo),
+   ITR (2yr), GST cert, MSME/Udyam, business plan, audited financials.
+   Add scheme-specific documents for the schemes above.
 
 2. "action_cards" - Array of one object per scheme, each with:
-   - "scheme_name": string
-   - "portal_url": string  
-   - "deadline": string (or "Rolling / Check Portal")
-   - "grant_amount": string
-   - "steps": array of 5-6 strings (ordered application steps)
-   - "estimated_days": number (realistic working days)
-   - "tips": array of 2-3 strings (insider tips)
+   {{"scheme_name": "string", "portal_url": "string", "deadline": "string",
+     "steps": ["step1", ...], "estimated_days": number, "tips": ["tip1", ...]}}
+   Include 5-6 steps per scheme and 2-3 practical tips.
 
-3. "cover_summary" - Exactly 150 words. Persuasive first-person paragraph that:
-   - Introduces the business (sector, state, type)
-   - Mentions team size and revenue
-   - States the funding purpose and alignment with government objectives
-   - Ends with a confident request for consideration
-   Write as "We/Our business..."
+3. "cover_summary" - Exactly ~150 words. First-person ("We/Our"), formal English.
+   Introduce the business, highlight strengths, state funding purpose,
+   show alignment with government objectives, end with a request.
 
-Return ONLY the JSON object. No markdown, no explanation."""
+Return ONLY valid JSON. No markdown fences, no explanation."""
 
     logger.info("[%s] Calling Gemini for report generation...", session_id)
 
@@ -159,16 +181,18 @@ Return ONLY the JSON object. No markdown, no explanation."""
         return None
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _parse_json_object(text: str) -> Optional[Dict]:
-    """Extract JSON object from LLM response."""
-    # Try markdown code block
+    """Extract JSON object from LLM response, handling markdown fences."""
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
             pass
-    # Try raw JSON object
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
@@ -179,7 +203,7 @@ def _parse_json_object(text: str) -> Optional[Dict]:
 
 
 def _fallback_report(profile: Dict[str, Any]) -> Dict[str, Any]:
-    """Curated fallback report when Gemini fails."""
+    """Curated fallback report when Gemini is unavailable."""
     name = profile.get("name", "Your Business")
     sector = profile.get("sector", "general")
     state = profile.get("state", "India")
@@ -190,56 +214,52 @@ def _fallback_report(profile: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "documents": [
-            {"name": "Aadhaar Card (Promoters)", "mandatory": True, "notes": "Self-attested copy of all promoters"},
-            {"name": "PAN Card (Business + Promoters)", "mandatory": True, "notes": "Both business entity PAN and individual PANs"},
-            {"name": "Certificate of Incorporation / Registration", "mandatory": True, "notes": "MOA, AOA for private limited; partnership deed for partnerships"},
-            {"name": "GST Registration Certificate", "mandatory": True, "notes": "Required if turnover exceeds Rs 20L"},
-            {"name": "MSME / Udyam Registration", "mandatory": True, "notes": "Register at udyamregistration.gov.in if not done"},
-            {"name": "Bank Account Statements", "mandatory": True, "notes": "Last 6-12 months, all business accounts"},
-            {"name": "Income Tax Returns (ITR)", "mandatory": True, "notes": "Last 2-3 financial years with CA certification"},
-            {"name": "Audited Financial Statements", "mandatory": revenue > 4000000, "notes": "Balance sheet, P&L — required if turnover > Rs 40L"},
-            {"name": "Business Plan / Project Report", "mandatory": True, "notes": "Detailed plan covering market, financials, and funding utilisation"},
-            {"name": "Photographs of Business Premises", "mandatory": False, "notes": "Exterior and interior, for physical verification"},
+            {"name": "Aadhaar Card (Promoters)", "mandatory": True, "description": "Self-attested copy of all promoters"},
+            {"name": "PAN Card (Business + Promoters)", "mandatory": True, "description": "Both entity PAN and individual PANs"},
+            {"name": "Certificate of Incorporation", "mandatory": True, "description": "MOA/AOA for Pvt Ltd; partnership deed for partnerships"},
+            {"name": "GST Registration Certificate", "mandatory": True, "description": "Required if turnover exceeds Rs 20 lakhs"},
+            {"name": "MSME / Udyam Registration", "mandatory": True, "description": "Register at udyamregistration.gov.in"},
+            {"name": "Bank Account Statements", "mandatory": True, "description": "Last 6-12 months, all business accounts"},
+            {"name": "Income Tax Returns (ITR)", "mandatory": True, "description": "Last 2-3 financial years with CA certification"},
+            {"name": "Audited Financial Statements", "mandatory": revenue > 4000000, "description": "Balance sheet and P&L, required if turnover > Rs 40L"},
+            {"name": "Business Plan / Project Report", "mandatory": True, "description": "Market analysis, financials, and fund utilisation plan"},
+            {"name": "Photographs of Business Premises", "mandatory": False, "description": "Exterior and interior for physical verification"},
         ],
         "action_cards": [
             {
                 "scheme_name": "CGTMSE Credit Guarantee",
                 "portal_url": "https://www.cgtmse.in/",
                 "deadline": "Rolling",
-                "grant_amount": "Guarantee on loans up to Rs 5 Cr",
                 "steps": [
                     "Register on the CGTMSE portal at cgtmse.in",
-                    "Approach your bank with your business plan and loan application",
+                    "Approach your bank with business plan and loan application",
                     "Bank submits proposal to CGTMSE on your behalf",
                     "CGTMSE reviews and issues guarantee certificate",
                     "Bank disburses the collateral-free loan",
-                    "Maintain repayment schedule to preserve guarantee status",
+                    "Maintain repayment schedule to preserve guarantee",
                 ],
                 "estimated_days": 45,
                 "tips": [
-                    "PSU banks (SBI, PNB) have faster CGTMSE processing than private banks",
-                    "Ensure Udyam registration is complete before applying — it speeds up verification",
-                    "Prepare a crisp 2-page executive summary of your business plan for the bank manager",
+                    "PSU banks (SBI, PNB) process CGTMSE faster than private banks",
+                    "Ensure Udyam registration is complete before applying",
                 ],
             },
             {
                 "scheme_name": "Startup India Seed Fund",
                 "portal_url": "https://seedfund.startupindia.gov.in/",
-                "deadline": "Rolling — quarterly cohorts",
-                "grant_amount": "Up to Rs 50 lakhs",
+                "deadline": "Rolling (quarterly cohorts)",
                 "steps": [
-                    "Register on startupindia.gov.in and get DPIIT recognition",
+                    "Get DPIIT recognition on startupindia.gov.in",
                     "Find an incubator in your state on the Seed Fund portal",
-                    "Submit application through the incubator's portal",
-                    "Present business plan and demo to incubator committee",
+                    "Submit application through the incubator",
+                    "Present business plan to incubator committee",
                     "Sign grant agreement and receive first tranche",
-                    "Submit utilisation certificates as per schedule",
+                    "Submit utilisation certificates per schedule",
                 ],
                 "estimated_days": 90,
                 "tips": [
-                    "DPIIT recognition is mandatory — apply at least 2 weeks before the incubator deadline",
-                    "Choose an incubator that specialises in your sector for better mentorship",
-                    "The grant is milestone-based — prepare quarterly progress reports in advance",
+                    "DPIIT recognition is mandatory - apply 2 weeks before incubator deadline",
+                    "Choose an incubator specialising in your sector",
                 ],
             },
         ],

@@ -1,255 +1,321 @@
 """
-ResearchService - Real Gemini-powered scheme research (Agent 2).
+research_service.py — Agent 2: Research Pipeline (REWRITTEN)
 
-Data flow:
-1. Reads UserProfile from DB by session_id
-2. Calls Gemini to find 15-25 real government schemes
-3. Parses response into scheme objects
-4. Writes to raw_schemes table
-5. Returns schemes for SSE emission
+Full pipeline:
+  1. URL Discovery   — Gemini generates target portal URLs for this profile
+  2. Web Scraping    — httpx (fast) → Playwright fallback (JS-heavy pages)
+  3. HTML Extraction — Gemini parses raw HTML → structured scheme records
+  4. Deduplication   — merge across pages, remove exact duplicates
+  5. ChromaDB Index  — index new schemes for future RAG retrieval
+  6. RAG Merge       — pull additional matches from existing ChromaDB index
+  7. Persist         — write final schemes to raw_schemes DB table
+
+Fallback at every stage: if Gemini / scraping fails, uses curated schemes.
 """
-from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import re
-from datetime import date
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any
 
-import google.genai as genai
-from sqlmodel import Session, select
+from sqlmodel import Session
 
-from config import settings
-from db.models import RawScheme, UserProfile as DBUserProfile
+from db.database import engine
+from db.models import RawScheme
 
-logger = logging.getLogger("govgrant.research")
+from .url_discovery import discover_urls
+from .scraper import scrape_urls
+from .html_extractor import extract_schemes_from_html, deduplicate_schemes
+from .chroma_indexer import index_schemes, rag_search
+
+logger = logging.getLogger(__name__)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+
+# Max pages to scrape per session (balance thoroughness vs latency)
+MAX_SCRAPE_URLS = 10
+
+# Minimum schemes before we stop (quality gate)
+MIN_SCHEMES_TARGET = 10
+
+# ── Curated fallback schemes ──────────────────────────────────────────────────
+
+FALLBACK_SCHEMES = [
+    {
+        "scheme_name": "CGTMSE — Credit Guarantee Fund Trust for Micro and Small Enterprises",
+        "criteria_text": "Collateral-free credit up to ₹5 crore for MSMEs. No third-party guarantee required.",
+        "deadline": None,
+        "max_revenue_inr": 25_00_00_000,
+        "eligible_types": ["msme", "startup", "proprietorship", "private_limited", "partnership", "llp"],
+        "grant_amount": "Up to ₹5 crore (credit guarantee)",
+        "portal_url": "https://cgtmse.in/",
+        "source_type": "offline",
+    },
+    {
+        "scheme_name": "PM Mudra Yojana — Shishu / Kishore / Tarun",
+        "criteria_text": "Loans for non-farm income generating activities up to ₹10 lakh. For micro enterprises.",
+        "deadline": None,
+        "max_revenue_inr": None,
+        "eligible_types": ["proprietorship", "msme", "partnership"],
+        "grant_amount": "Up to ₹10 lakh",
+        "portal_url": "https://www.mudra.org.in/",
+        "source_type": "offline",
+    },
+    {
+        "scheme_name": "Stand Up India — SC/ST and Women Entrepreneurs",
+        "criteria_text": "Bank loans between ₹10 lakh and ₹1 crore for SC/ST and women entrepreneurs for greenfield enterprises.",
+        "deadline": None,
+        "max_revenue_inr": None,
+        "eligible_types": ["proprietorship", "private_limited", "partnership", "llp"],
+        "grant_amount": "₹10 lakh to ₹1 crore",
+        "portal_url": "https://www.standupmitra.in/",
+        "source_type": "offline",
+    },
+    {
+        "scheme_name": "PM Employment Generation Programme (PMEGP)",
+        "criteria_text": "Subsidy 15-35% of project cost for setting up new micro-enterprises in manufacturing/service sectors.",
+        "deadline": None,
+        "max_revenue_inr": None,
+        "eligible_types": ["proprietorship", "msme", "cooperative", "ngo", "partnership"],
+        "grant_amount": "15-35% subsidy on project cost",
+        "portal_url": "https://www.kviconline.gov.in/pmegpeportal/pmegphome/index.jsp",
+        "source_type": "offline",
+    },
+    {
+        "scheme_name": "Startup India Seed Fund Scheme (SISFS)",
+        "criteria_text": "Grants/soft loans for DPIIT-recognised startups at ideation/POC/prototype stage.",
+        "deadline": None,
+        "max_revenue_inr": None,
+        "eligible_types": ["startup", "private_limited", "llp"],
+        "grant_amount": "Up to ₹20 lakh (grant) + ₹50 lakh (convertible debentures)",
+        "portal_url": "https://seedfund.startupindia.gov.in/",
+        "source_type": "offline",
+    },
+]
 
 
-async def run_research(
-    session_id: str,
-    profile_data: Dict[str, Any],
-    db: Session,
-) -> List[Dict[str, Any]]:
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+
+async def run_research_pipeline(profile: dict[str, Any], session_id: str) -> list[dict]:
     """
-    Run Agent 2: call Gemini to find government schemes, persist to DB.
+    Full research pipeline for Agent 2.
 
-    Returns list of scheme dicts written to raw_schemes table.
+    Args:
+        profile: User profile dict from user_profiles table
+        session_id: Current session UUID
+
+    Returns:
+        List of raw scheme dicts persisted to raw_schemes table
     """
-    logger.info("[%s] === RESEARCH START ===", session_id)
-    logger.info(
-        "[%s] Profile: sector=%s, state=%s, entity=%s, revenue=%s",
-        session_id,
-        profile_data.get("sector"),
-        profile_data.get("state"),
-        profile_data.get("entity_type", profile_data.get("type")),
-        profile_data.get("annual_revenue_inr", profile_data.get("revenue_inr")),
-    )
+    logger.info(f"[research] Starting research pipeline for session {session_id}")
+    logger.info(f"[research] Profile: sector={profile.get('sector')}, state={profile.get('state')}, "
+                f"entity={profile.get('entity_type')}, revenue={profile.get('annual_revenue_inr')}")
 
-    # Call Gemini for real scheme research
-    schemes = await _gemini_search(session_id, profile_data)
+    all_schemes: list[dict] = []
 
-    if not schemes:
-        logger.warning("[%s] Gemini returned 0 schemes - using fallback", session_id)
-        schemes = _fallback_schemes(profile_data)
+    # ── STEP 1: Check ChromaDB for existing indexed schemes (RAG) ─────────────
+    rag_query = _build_rag_query(profile)
+    existing_rag = await _safe_rag_search(rag_query)
+    if existing_rag:
+        logger.info(f"[research] RAG returned {len(existing_rag)} existing schemes from index")
+        all_schemes.extend(existing_rag)
 
-    # Persist to raw_schemes table
-    logger.info("[%s] Writing %d schemes to raw_schemes", session_id, len(schemes))
-
-    # Clear existing (idempotent re-runs)
-    existing = db.exec(
-        select(RawScheme).where(RawScheme.session_id == session_id)
-    ).all()
-    for row in existing:
-        db.delete(row)
-    if existing:
-        db.commit()
-
-    for i, s in enumerate(schemes):
-        try:
-            deadline_val = None
-            if s.get("deadline"):
-                try:
-                    deadline_val = date.fromisoformat(str(s["deadline"]))
-                except (ValueError, TypeError):
-                    pass
-
-            db.add(RawScheme(
-                session_id=session_id,
-                scheme_name=s.get("name", s.get("scheme_name", f"Scheme {i+1}")),
-                source_url=s.get("portal_url", s.get("source_url", "")),
-                source_type=s.get("source", "web_search"),
-                criteria_text=s.get("description", s.get("criteria_text", "")),
-                deadline=deadline_val,
-                max_revenue_inr=s.get("max_revenue_inr"),
-                eligible_types=json.dumps(
-                    s.get("eligible_entity_types", s.get("eligible_types", []))
-                ),
-            ))
-            logger.info("  [%s] Scheme %d: %s", session_id, i+1,
-                        s.get("name", s.get("scheme_name", "?")))
-        except Exception as e:
-            logger.error("[%s] Failed to persist scheme %d: %s", session_id, i+1, str(e))
-
-    db.commit()
-    logger.info("[%s] === RESEARCH DONE - %d schemes persisted ===", session_id, len(schemes))
-    return schemes
-
-
-async def _gemini_search(
-    session_id: str,
-    profile_data: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """Call Gemini to find real government schemes."""
-    sector = profile_data.get("sector", "general")
-    state = profile_data.get("state", "India")
-    entity = profile_data.get("entity_type", profile_data.get("type", "msme"))
-    revenue = profile_data.get("annual_revenue_inr", profile_data.get("revenue_inr", 0))
-    purpose = profile_data.get("purpose", profile_data.get("funding_purpose", "general"))
-
-    prompt = f"""Find 15-20 REAL Indian government grant schemes and subsidies for this business:
-- Sector: {sector}
-- State: {state}
-- Entity type: {entity}
-- Annual revenue: INR {revenue}
-- Funding purpose: {purpose}
-
-Return ONLY a valid JSON array. Each object must have these exact keys:
-- "name": string (official scheme name)
-- "portal_url": string (official website URL)
-- "description": string (1-line eligibility summary)
-- "eligible_entity_types": string[] (e.g. ["startup", "msme"])
-- "eligible_states": string[] (empty = pan-India)
-- "max_revenue_inr": number or null
-- "deadline": string (ISO date) or null
-- "source": "web_search"
-
-IMPORTANT:
-- Only include REAL schemes with actual portal URLs
-- Include both central (pan-India) and {state} state schemes
-- Include MSME schemes, startup schemes, and sector-specific schemes
-- No markdown, no explanation - just the JSON array"""
-
-    logger.info("[%s] Calling Gemini for scheme search...", session_id)
-
+    # ── STEP 2: Discover URLs to scrape ──────────────────────────────────────
+    target_urls = []
     try:
-        client = genai.Client(api_key=settings.GOOGLE_API_KEY)
-        response = client.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
-            config=genai.types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=8192,
-            ),
-        )
-        text = response.text or ""
-        schemes = _parse_json_array(text, session_id)
-        logger.info("[%s] Gemini returned %d schemes", session_id, len(schemes))
+        target_urls = await discover_urls(profile, GOOGLE_API_KEY, GEMINI_MODEL)
+        logger.info(f"[research] Discovered {len(target_urls)} URLs to scrape")
+    except Exception as e:
+        logger.error(f"[research] URL discovery failed: {e}")
+
+    # Limit to MAX_SCRAPE_URLS
+    target_urls = target_urls[:MAX_SCRAPE_URLS]
+
+    # ── STEP 3: Scrape all URLs ───────────────────────────────────────────────
+    scraped_html: dict[str, str | None] = {}
+    if target_urls:
+        try:
+            scraped_html = await scrape_urls(target_urls, concurrency=3)
+            successful = sum(1 for v in scraped_html.values() if v)
+            logger.info(f"[research] Scraped {successful}/{len(target_urls)} URLs successfully")
+        except Exception as e:
+            logger.error(f"[research] Scraping failed: {e}")
+
+    # ── STEP 4: Extract schemes from each scraped page ────────────────────────
+    newly_scraped: list[dict] = []
+    extraction_tasks = []
+
+    for url, html in scraped_html.items():
+        if html:
+            extraction_tasks.append(
+                extract_schemes_from_html(html, url, profile, GOOGLE_API_KEY, GEMINI_MODEL)
+            )
+
+    if extraction_tasks:
+        results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"[research] Extraction task failed: {result}")
+            elif isinstance(result, list):
+                newly_scraped.extend(result)
+
+        logger.info(f"[research] Extracted {len(newly_scraped)} schemes from scraped pages")
+
+    # ── STEP 5: Deduplicate newly scraped schemes ─────────────────────────────
+    if newly_scraped:
+        newly_scraped = deduplicate_schemes(newly_scraped)
+
+        # ── STEP 6: Index new schemes into ChromaDB ───────────────────────────
+        try:
+            indexed = await index_schemes(newly_scraped, GOOGLE_API_KEY)
+            logger.info(f"[research] Indexed {indexed} new schemes into ChromaDB")
+        except Exception as e:
+            logger.error(f"[research] ChromaDB indexing failed: {e}")
+
+        all_schemes.extend(newly_scraped)
+
+    # ── STEP 7: Final dedup across RAG + newly scraped ───────────────────────
+    all_schemes = deduplicate_schemes(all_schemes)
+    logger.info(f"[research] Total unique schemes after merge: {len(all_schemes)}")
+
+    # ── STEP 8: Fallback if we have too few results ───────────────────────────
+    if len(all_schemes) < 5:
+        logger.warning(f"[research] Only {len(all_schemes)} schemes found, adding fallback schemes")
+        all_schemes.extend(FALLBACK_SCHEMES)
+        all_schemes = deduplicate_schemes(all_schemes)
+
+    # ── STEP 9: Persist to raw_schemes table ─────────────────────────────────
+    persisted = _persist_raw_schemes(all_schemes, session_id)
+    logger.info(f"[research] Persisted {len(persisted)} schemes to raw_schemes table")
+
+    return persisted
+
+
+def _build_rag_query(profile: dict) -> str:
+    """Build a semantic search query from the profile."""
+    parts = [
+        profile.get("sector", ""),
+        profile.get("entity_type", ""),
+        profile.get("state", ""),
+        "government grant scheme subsidy",
+        profile.get("purpose", ""),
+    ]
+    return " ".join(p for p in parts if p)
+
+
+async def _safe_rag_search(query: str) -> list[dict]:
+    """RAG search with error handling."""
+    try:
+        results = await rag_search(query, GOOGLE_API_KEY, n_results=15)
+        # Convert RAG metadata back to scheme dicts
+        schemes = []
+        for r in results:
+            scheme = {
+                "scheme_name": r.get("scheme_name", ""),
+                "criteria_text": r.get("criteria_text", ""),
+                "deadline": r.get("deadline") or None,
+                "max_revenue_inr": r.get("max_revenue_inr") or None,
+                "eligible_types": r.get("eligible_types", "").split(",") if r.get("eligible_types") else [],
+                "grant_amount": r.get("grant_amount", ""),
+                "portal_url": r.get("source_url", ""),
+                "source_type": "live",
+            }
+            if scheme["scheme_name"]:
+                schemes.append(scheme)
         return schemes
     except Exception as e:
-        logger.error("[%s] Gemini search failed: %s", session_id, str(e))
+        logger.warning(f"[research] RAG search failed silently: {e}")
         return []
 
 
-def _parse_json_array(text: str, session_id: str) -> List[Dict]:
-    """Extract JSON array from LLM text output."""
-    # Try markdown code block first
-    match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            pass
+def _persist_raw_schemes(schemes: list[dict], session_id: str) -> list[dict]:
+    """Write scheme records to the raw_schemes table."""
+    persisted = []
 
-    # Try raw JSON array
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
+    with Session(engine) as db:
+        for s in schemes:
+            eligible = s.get("eligible_types", [])
+            if isinstance(eligible, list):
+                eligible_json = json.dumps(eligible)
+            else:
+                eligible_json = json.dumps([eligible]) if eligible else "[]"
 
-    logger.error("[%s] Could not parse JSON from Gemini output", session_id)
-    return []
+            revenue = s.get("max_revenue_inr")
+            try:
+                revenue = int(revenue) if revenue is not None else None
+            except (TypeError, ValueError):
+                revenue = None
+
+            deadline = s.get("deadline")
+            if deadline and isinstance(deadline, str) and len(deadline) < 4:
+                deadline = None
+
+            record = RawScheme(
+                session_id=session_id,
+                scheme_name=s.get("scheme_name", "Unknown Scheme"),
+                source_url=s.get("portal_url") or s.get("source_url") or "",
+                source_type=s.get("source_type", "live"),
+                criteria_text=s.get("criteria_text", ""),
+                deadline=deadline,
+                max_revenue_inr=revenue,
+                eligible_types=eligible_json,
+            )
+            db.add(record)
+            persisted.append(s)
+
+        db.commit()
+
+    return persisted
 
 
-def read_profile_from_db(session_id: str, db: Session) -> Optional[Dict[str, Any]]:
-    """Read UserProfile from DB for a given session_id."""
-    logger.info("[%s] Reading profile from DB", session_id)
+# ── Helpers for routes.py ────────────────────────────────────────────────────
+
+def read_profile_from_db(session_id: str, db: Session) -> dict | None:
+    """Read a UserProfile from the DB and return it as a dict (or None)."""
+    from db.models import UserProfile
+    from sqlmodel import select
+
     profile = db.exec(
-        select(DBUserProfile).where(DBUserProfile.session_id == session_id)
+        select(UserProfile).where(UserProfile.session_id == session_id)
     ).first()
-
     if not profile:
-        logger.warning("[%s] No profile found in DB", session_id)
         return None
 
-    result = {
-        "session_id": profile.session_id,
+    return {
         "name": profile.name,
         "type": profile.type,
         "sector": profile.sector,
         "state": profile.state,
-        "city": profile.city,
+        "city": getattr(profile, "city", ""),
         "team_size": profile.team_size,
         "revenue_inr": profile.revenue_inr,
-        "funding_purpose": profile.funding_purpose,
+        "funding_purpose": getattr(profile, "funding_purpose", "general"),
+        "entity_type": profile.type,
+        "annual_revenue_inr": profile.revenue_inr,
+        "purpose": getattr(profile, "funding_purpose", "general"),
+        "session_id": session_id,
     }
-    logger.info("[%s] Profile loaded: %s (%s, %s)", session_id,
-                result["name"], result["sector"], result["state"])
-    return result
 
 
-def _fallback_schemes(profile_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Curated fallback when Gemini fails."""
-    return [
-        {
-            "name": "CGTMSE Credit Guarantee",
-            "portal_url": "https://www.cgtmse.in/",
-            "description": "Collateral-free credit up to Rs 5 Cr for MSMEs",
-            "eligible_entity_types": ["msme", "proprietorship", "private_limited"],
-            "eligible_states": [],
-            "max_revenue_inr": 100000000,
-            "deadline": None,
-            "source": "curated",
-        },
-        {
-            "name": "MUDRA Loan Scheme",
-            "portal_url": "https://www.mudra.org.in/",
-            "description": "Micro-credit loans from Rs 50K to Rs 10L",
-            "eligible_entity_types": ["startup", "msme", "proprietorship"],
-            "eligible_states": [],
-            "max_revenue_inr": 15000000,
-            "deadline": None,
-            "source": "curated",
-        },
-        {
-            "name": "Stand Up India",
-            "portal_url": "https://www.standupmitra.in/",
-            "description": "Loans Rs 10L-1Cr for SC/ST and women entrepreneurs",
-            "eligible_entity_types": ["startup", "msme", "private_limited"],
-            "eligible_states": [],
-            "max_revenue_inr": None,
-            "deadline": None,
-            "source": "curated",
-        },
-        {
-            "name": "PMEGP",
-            "portal_url": "https://www.kviconline.gov.in/pmegpeportal/",
-            "description": "35% subsidy for manufacturing projects",
-            "eligible_entity_types": ["startup", "msme", "proprietorship"],
-            "eligible_states": [],
-            "max_revenue_inr": 25000000,
-            "deadline": None,
-            "source": "curated",
-        },
-        {
-            "name": "Startup India Seed Fund",
-            "portal_url": "https://seedfund.startupindia.gov.in/",
-            "description": "Up to Rs 50L for proof of concept and prototype",
-            "eligible_entity_types": ["startup", "private_limited"],
-            "eligible_states": [],
-            "max_revenue_inr": 50000000,
-            "deadline": None,
-            "source": "curated",
-        },
-    ]
+async def run_research(
+    session_id: str,
+    profile_data: dict,
+    db: Session,
+) -> list[dict]:
+    """
+    Wrapper called by routes.py's pipeline endpoint.
+    Delegates to the full research pipeline.
+    """
+    profile = {
+        "sector": profile_data.get("sector", ""),
+        "state": profile_data.get("state", ""),
+        "entity_type": profile_data.get("entity_type") or profile_data.get("type", ""),
+        "annual_revenue_inr": profile_data.get("annual_revenue_inr") or profile_data.get("revenue_inr", 0),
+        "team_size": profile_data.get("team_size", 1),
+        "purpose": profile_data.get("purpose") or profile_data.get("funding_purpose", "general"),
+    }
+    return await run_research_pipeline(profile, session_id)

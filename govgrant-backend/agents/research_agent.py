@@ -1,140 +1,151 @@
 """
-ResearchAgent — Hybrid RAG + Gemini web search agent.
+research_agent.py — Agent 2: ResearchAgent (Google ADK definition)
 
-Pipeline:
-1. Queries ChromaDB (pre-indexed scheme PDFs) for relevant chunks
-2. Uses Gemini's Google Search grounding for live scheme data
-3. Merges, deduplicates, and returns 15–25 raw Scheme objects
+ADK agent that wraps the full scrape pipeline as callable tools.
+In the ADK sequential pipeline, this agent:
+  1. Receives the user_profile from Agent 1 (IntakeAgent)
+  2. Calls scrape_and_extract_schemes tool
+  3. Returns structured raw_schemes list
+
+The actual heavy lifting is in research_service.py.
 """
-from __future__ import annotations
 
+import asyncio
 import json
-import os
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any
 
-import chromadb
-from chromadb.utils import embedding_functions
-from google.adk.agents import LlmAgent
-from google.adk.tools import FunctionTool, google_search
-from google.genai import types
+from google.adk.agents import Agent
+from google.adk.tools import FunctionTool
 
-from schemas import Scheme, UserProfile
-
-# ─── ChromaDB Setup ────────────────────────────────────────────────────────────
-
-CHROMA_PATH = os.getenv("CHROMA_DB_PATH", "./data/chroma_db")
-COLLECTION_NAME = "govgrant_schemes"
+logger = logging.getLogger(__name__)
 
 
-def _get_chroma_collection():
-    """Lazy-load ChromaDB collection."""
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
-    ef = embedding_functions.GoogleGenerativeAiEmbeddingFunction(
-        api_key=os.environ["GOOGLE_API_KEY"],
-        model_name="models/text-embedding-004",
-    )
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=ef,
-        metadata={"hnsw:space": "cosine"},
-    )
+# ── Tool: scrape_and_extract_schemes ─────────────────────────────────────────
 
-
-# ─── RAG Tool ──────────────────────────────────────────────────────────────────
-
-def rag_scheme_search(
-    query: str,
+async def scrape_and_extract_schemes(
     sector: str,
     state: str,
     entity_type: str,
-    n_results: int = 20,
-) -> List[Dict[str, Any]]:
+    annual_revenue_inr: int,
+    team_size: int,
+    purpose: str,
+    session_id: str,
+) -> dict[str, Any]:
     """
-    Search the ChromaDB vector store for relevant government schemes.
-    Returns a list of raw scheme chunk metadata dicts.
+    Full research pipeline: discover URLs → scrape → extract → index → return.
+
+    Args:
+        sector: Business sector (e.g. food_processing, it_tech)
+        state: Indian state (e.g. Maharashtra, Karnataka)
+        entity_type: Entity type (e.g. startup, msme, private_limited)
+        annual_revenue_inr: Annual revenue in INR (0 for pre-revenue)
+        team_size: Number of employees
+        purpose: Funding purpose (e.g. technology_upgrade, working_capital)
+        session_id: Current session UUID
+
+    Returns:
+        {"schemes": [...], "count": int, "status": "ok"|"fallback"}
     """
-    collection = _get_chroma_collection()
-    enriched_query = (
-        f"Government grant scheme for {entity_type} in {sector} sector "
-        f"in {state}, India. {query}"
-    )
-    results = collection.query(
-        query_texts=[enriched_query],
-        n_results=min(n_results, collection.count()),
-        where={
-            "$or": [
-                {"sector": {"$in": [sector, "all"]}},
-                {"state": {"$in": [state, "pan_india"]}},
-            ]
-        },
-    )
-    schemes = []
-    for i, (doc, meta) in enumerate(
-        zip(results["documents"][0], results["metadatas"][0])
-    ):
-        schemes.append({
-            "scheme_id": meta.get("scheme_id", f"rag_{i}"),
-            "name": meta.get("name", "Unknown Scheme"),
-            "ministry": meta.get("ministry", ""),
-            "portal_url": meta.get("portal_url", ""),
-            "description": meta.get("description", doc[:200]),
-            "eligible_sectors": meta.get("eligible_sectors", [sector]),
-            "eligible_entity_types": meta.get("eligible_entity_types", []),
-            "eligible_states": meta.get("eligible_states", []),
-            "max_revenue_inr": meta.get("max_revenue_inr"),
-            "max_team_size": meta.get("max_team_size"),
-            "grant_amount_inr": meta.get("grant_amount_inr"),
-            "deadline": meta.get("deadline"),
-            "source": "rag",
-            "raw_chunk": doc[:500],
-        })
-    return schemes
+    from .research_service import run_research_pipeline
+
+    profile = {
+        "sector": sector,
+        "state": state,
+        "entity_type": entity_type,
+        "annual_revenue_inr": annual_revenue_inr,
+        "team_size": team_size,
+        "purpose": purpose,
+    }
+
+    try:
+        schemes = await run_research_pipeline(profile, session_id)
+        return {
+            "schemes": schemes,
+            "count": len(schemes),
+            "status": "ok",
+        }
+    except Exception as e:
+        logger.error(f"[research_agent] Pipeline failed: {e}")
+        from .research_service import FALLBACK_SCHEMES
+        return {
+            "schemes": FALLBACK_SCHEMES,
+            "count": len(FALLBACK_SCHEMES),
+            "status": "fallback",
+            "error": str(e),
+        }
 
 
-rag_search_tool = FunctionTool(func=rag_scheme_search)
+# ── Tool: rag_lookup ──────────────────────────────────────────────────────────
+
+async def rag_lookup(query: str) -> dict[str, Any]:
+    """
+    Search the ChromaDB index for relevant schemes matching a query.
+    Useful when you want to find schemes without re-scraping.
+
+    Args:
+        query: Natural language query (e.g. "food processing MSME Maharashtra")
+
+    Returns:
+        {"schemes": [...], "count": int}
+    """
+    from .chroma_indexer import rag_search, get_collection_stats
+    import os
+
+    api_key = os.environ.get("GOOGLE_API_KEY", "")
+    try:
+        stats = get_collection_stats()
+        logger.info(f"[research_agent] ChromaDB has {stats.get('total_schemes', 0)} schemes indexed")
+
+        schemes = await rag_search(query, api_key, n_results=15)
+        return {"schemes": schemes, "count": len(schemes)}
+    except Exception as e:
+        logger.error(f"[research_agent] RAG lookup failed: {e}")
+        return {"schemes": [], "count": 0, "error": str(e)}
 
 
-# ─── System Prompt ─────────────────────────────────────────────────────────────
+# ── ADK Agent Definition ──────────────────────────────────────────────────────
 
-RESEARCH_SYSTEM_PROMPT = """You are GovGrant's research specialist. Given a UserProfile JSON,
-your job is to find 15–25 relevant Indian government grant schemes and subsidies.
+_RESEARCH_INSTRUCTION = """You are the Research Agent for GovGrant, an AI platform that
+discovers government grant schemes for Indian businesses.
 
-PROCESS:
-1. Call `rag_scheme_search` with the user's sector, state, entity_type as parameters
-2. Use Google Search to find additional current schemes — search for:
-   - "{sector} government scheme India 2024 2025"
-   - "{state} state government grant {entity_type}"
-   - "Ministry of MSME scheme {purpose} India"
-   - Women/SC-ST specific schemes if applicable
-3. Merge results, removing duplicates (same scheme_id or portal_url)
-4. Return a JSON array of Scheme objects
+Your job is to find the most relevant government grant schemes for the business
+described in the user_profile from the previous step.
+
+WORKFLOW:
+1. Extract the business profile fields from the context (sector, state, entity_type,
+   annual_revenue_inr, team_size, purpose, session_id).
+2. Call scrape_and_extract_schemes with these exact fields.
+3. If scrape_and_extract_schemes returns status="fallback", also call rag_lookup
+   with a query built from the sector + state + entity type.
+4. Return the combined list of schemes as the output key "raw_schemes".
 
 IMPORTANT:
-- Only return real, verifiable schemes with actual portal URLs
-- Mark source as 'rag' or 'web_search' accordingly
-- Include both central (pan-India) and state-specific schemes
-- Prioritize schemes with open application windows
-- Aim for 15–25 results before deduplication
+- Always pass session_id from the context to scrape_and_extract_schemes.
+- Do not hallucinate or invent schemes.
+- Do not modify scheme data returned by the tools.
+- If both tools fail, return an empty list with a note.
 
-OUTPUT: Return a JSON array of scheme objects matching the Scheme schema."""
+OUTPUT FORMAT:
+Return a JSON object:
+{
+  "raw_schemes": [ /* array of scheme objects from tool */ ],
+  "total_found": <integer>,
+  "research_method": "scraped" | "rag" | "fallback"
+}
+"""
 
-
-# ─── Agent Factory ─────────────────────────────────────────────────────────────
-
-def create_research_agent(model: str = "gemini-2.0-flash") -> LlmAgent:
-    """Create and return the configured ResearchAgent."""
-    return LlmAgent(
-        name="research_agent",
-        model=model,
-        description=(
-            "Hybrid RAG + web-search agent that finds 15–25 relevant "
-            "government grant schemes for a given business profile."
-        ),
-        instruction=RESEARCH_SYSTEM_PROMPT,
-        tools=[rag_search_tool, google_search],
-        output_key="raw_schemes",
-        generate_content_config=types.GenerateContentConfig(
-            temperature=0.1,
-            max_output_tokens=8192,
-        ),
-    )
+research_agent = Agent(
+    name="ResearchAgent",
+    model="gemini-2.0-flash",
+    description=(
+        "Discovers relevant Indian government grant schemes by scraping official portals, "
+        "extracting structured data, and searching the ChromaDB vector index."
+    ),
+    instruction=_RESEARCH_INSTRUCTION,
+    tools=[
+        FunctionTool(scrape_and_extract_schemes),
+        FunctionTool(rag_lookup),
+    ],
+    output_key="raw_schemes",
+)

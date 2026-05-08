@@ -19,7 +19,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export function ChatWindow({ onIntakeComplete, onFieldsCollected, sessionId }: ChatWindowProps) {
   const [messages, setMessages] = useState<Message[]>([
-    { role: 'bot', content: 'Hi! I\'m your GovGrant assistant. 👋\n\nI\'ll ask you 6 quick questions about your business to find the best government grants you\'re eligible for.\n\nReady? Just type anything to begin!' }
+    { role: 'bot', content: 'Hi! I\'m your GovGrant assistant. 👋\n\nTell me about your business — what\'s it called, what do you do, and where are you based? I\'ll find the best government grants you\'re eligible for.\n\nFor example: "We\'re TechVista, a SaaS startup in Pune with 15 employees."' }
   ]);
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);

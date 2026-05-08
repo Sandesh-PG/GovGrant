@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, use } from 'react';
 import { useRouter } from 'next/navigation';
 import { Shield, ArrowLeft, Download, Bell, ExternalLink, FileText, CheckCircle2 } from 'lucide-react';
 import { GrantCard } from '@/components/GrantCard';
@@ -9,7 +9,8 @@ import { CoverSummary } from '@/components/CoverSummary';
 import { api } from '@/lib/api';
 import { GrantReport } from '@/lib/types';
 
-export default function ResultsPage({ params }: { params: { session_id: string } }) {
+export default function ResultsPage({ params }: { params: Promise<{ session_id: string }> }) {
+  const { session_id } = use(params);
   const [report, setReport] = useState<GrantReport | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const router = useRouter();
@@ -23,7 +24,7 @@ export default function ResultsPage({ params }: { params: { session_id: string }
 
     const fetchResults = async () => {
       try {
-        const data = await api.getResults(params.session_id);
+        const data = await api.getResults(session_id);
         setReport(data);
       } catch (err) {
         console.error('Failed to fetch results', err);
@@ -33,7 +34,7 @@ export default function ResultsPage({ params }: { params: { session_id: string }
     };
 
     fetchResults();
-  }, [params.session_id, router]);
+  }, [session_id, router]);
 
   if (isLoading) {
     return (
@@ -59,12 +60,30 @@ export default function ResultsPage({ params }: { params: { session_id: string }
     <div className="min-h-screen bg-slate-50 flex flex-col">
       {/* Header */}
       <header className="px-6 py-4 bg-white border-b border-slate-100 flex items-center justify-between sticky top-0 z-10">
-        <div className="flex items-center space-x-2">
-          <Shield className="text-blue-600 w-5 h-5" />
-          <span className="font-outfit font-bold text-lg text-slate-900">GovGrant</span>
+        <div className="flex items-center space-x-4">
+          <button
+            onClick={() => router.push('/')}
+            className="flex items-center text-sm font-semibold text-slate-500 hover:text-blue-600 transition-colors px-2.5 py-1.5 rounded-xl hover:bg-slate-50 group"
+            id="results-back-button"
+          >
+            <ArrowLeft size={16} className="mr-1.5 group-hover:-translate-x-0.5 transition-transform" />
+            Home
+          </button>
+          <div className="w-px h-6 bg-slate-200" />
+          <div className="flex items-center space-x-2">
+            <Shield className="text-blue-600 w-5 h-5" />
+            <span className="font-outfit font-bold text-lg text-slate-900">GovGrant</span>
+          </div>
         </div>
         
-        <div className="flex items-center space-x-4">
+        <div className="flex items-center space-x-3">
+          <button 
+            onClick={() => router.push('/chat')}
+            className="flex items-center text-sm font-semibold text-slate-600 hover:text-blue-600 transition-colors px-3 py-2 rounded-xl hover:bg-slate-50"
+            id="results-new-search-button"
+          >
+            New Search
+          </button>
           <button 
             onClick={() => window.print()}
             className="flex items-center text-sm font-semibold text-slate-600 hover:text-blue-600 transition-colors px-3 py-2 rounded-xl hover:bg-slate-50"
@@ -73,7 +92,7 @@ export default function ResultsPage({ params }: { params: { session_id: string }
             PDF Report
           </button>
           <button 
-            onClick={() => router.push(`/alerts?session_id=${params.session_id}`)}
+            onClick={() => router.push(`/alerts?session_id=${session_id}`)}
             className="flex items-center px-4 py-2.5 bg-blue-600 text-white text-sm font-bold rounded-xl hover:bg-blue-700 transition-all shadow-lg shadow-blue-200"
           >
             <Bell size={16} className="mr-2" />

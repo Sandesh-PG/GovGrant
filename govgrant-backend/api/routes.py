@@ -359,39 +359,35 @@ def list_sessions(
 # CHAT ROUTE — Conversational intake + SSE pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Mock intake conversation: bot asks 6 questions one-by-one
-INTAKE_QUESTIONS = [
-    {
-        "question": "What is the name of your business or organisation?",
-        "field": "name",
-        "example": "e.g. GreenLeaf Organics Pvt. Ltd.",
-    },
-    {
-        "question": "What type of entity is it?",
-        "field": "type",
-        "example": "e.g. Private Limited, Proprietorship, Partnership, LLP, Startup, MSME",
-    },
-    {
-        "question": "Which sector or industry does your business operate in?",
-        "field": "sector",
-        "example": "e.g. Food Processing, IT Services, Manufacturing, Textiles, Agriculture",
-    },
-    {
-        "question": "Which state and city is your business located in?",
-        "field": "state",
-        "example": "e.g. Maharashtra, Pune",
-    },
-    {
-        "question": "How many people are on your team?",
-        "field": "team_size",
-        "example": "e.g. 12 employees",
-    },
-    {
-        "question": "What is your approximate annual revenue (in ₹) and what do you need the funding for?",
-        "field": "revenue_and_purpose",
-        "example": "e.g. ₹80 lakhs annual revenue; need funding for technology upgrade",
-    },
-]
+# ── Conversational intake fields ─────────────────────────────────────────────
+# These define the data we need, but the conversation flow is dynamic,
+# not a rigid one-question-per-field form.
+
+_INTAKE_FIELDS = ["name", "type", "sector", "state", "team_size", "revenue_and_purpose"]
+
+# Known entity types / sectors for fuzzy matching in user answers
+_ENTITY_TYPES = {
+    "startup", "msme", "proprietorship", "partnership", "private_limited",
+    "public_limited", "llp", "ngo", "cooperative", "other",
+    # common aliases
+    "pvt ltd", "pvt. ltd", "pvt. ltd.", "private limited", "sole proprietorship",
+    "limited liability partnership",
+}
+_SECTORS = {
+    "agriculture", "manufacturing", "it_tech", "it", "tech", "software",
+    "healthcare", "education", "food_processing", "food", "textile", "textiles",
+    "renewable_energy", "solar", "fintech", "retail", "logistics", "export",
+    "construction", "real_estate", "pharma", "biotech", "ev", "electric_vehicle",
+    "handicraft", "handloom", "tourism", "hospitality", "other",
+}
+_INDIAN_STATES = {
+    "andhra pradesh", "arunachal pradesh", "assam", "bihar", "chhattisgarh",
+    "goa", "gujarat", "haryana", "himachal pradesh", "jharkhand", "karnataka",
+    "kerala", "madhya pradesh", "maharashtra", "manipur", "meghalaya", "mizoram",
+    "nagaland", "odisha", "punjab", "rajasthan", "sikkim", "tamil nadu",
+    "telangana", "tripura", "uttar pradesh", "uttarakhand", "west bengal",
+    "delhi", "chandigarh", "jammu and kashmir", "ladakh", "puducherry",
+}
 
 
 def _verify_session_ownership(
@@ -419,7 +415,7 @@ async def chat(
     logger.info("[%s] /chat called - message: %.80s", body.session_id, body.message)
     _verify_session_ownership(body.session_id, user, db)
 
-    # Try real Gemini first, fall back to hardcoded questions if API fails
+    # Try real Gemini first, fall back to smart conversational flow if API fails
     try:
         result = await process_intake_message(
             session_id=body.session_id,
@@ -428,7 +424,7 @@ async def chat(
         )
         logger.info("[%s] Gemini intake OK", body.session_id)
     except Exception as e:
-        logger.warning("[%s] Gemini intake failed (%s), using fallback questions", body.session_id, str(e)[:120])
+        logger.warning("[%s] Gemini intake failed (%s), using conversational fallback", body.session_id, str(e)[:120])
         result = _fallback_intake(body)
 
     # If intake is complete, persist the profile to DB
@@ -471,69 +467,321 @@ async def chat(
     return result
 
 
-def _fallback_intake(body: ChatRequest) -> dict:
-    """Hardcoded question flow used when Gemini API is unavailable."""
+def _parse_fields_from_history(history: list, current_message: str) -> dict:
+    """
+    Intelligently extract business fields from the entire conversation so far.
+    Scans ALL user messages (not just the latest) so multi-field answers work.
+    """
     import re
+
+    collected: dict = {}
+    all_user_text = " ".join(
+        m.get("content", m.get("text", ""))
+        for m in history
+        if m.get("role") == "user"
+    )
+    all_user_text += " " + current_message
+    all_lower = all_user_text.lower()
+
+    # ── Name: extract business name from patterns across all messages
+    import re as _re
+    name_patterns = [
+        r"(?:we are|we're|i run|i own|my (?:company|business|firm|startup|organisation|organization) is|called|named)\s+([A-Z][A-Za-z\s&.'-]+?)(?:\s*[,.]|\s+(?:a|an|in|based|from|is|which|we|with|and|\d))",
+        r"^([A-Z][A-Za-z\s&.'-]{2,}?)(?:\s*[,.]|\s+(?:is|a|an|in|based|from|we|which|pvt|private|llp))",
+    ]
+    for pat in name_patterns:
+        for msg_text in ([current_message] + [m.get("content", m.get("text", "")) for m in history if m.get("role") == "user"]):
+            match = _re.search(pat, msg_text)
+            if match:
+                name_candidate = match.group(1).strip().rstrip(".,")
+                # Filter out generic words that aren't business names
+                skip = {"we", "i", "my", "the", "a", "an", "hello", "hi", "hey", "yes", "ok"}
+                if name_candidate.lower() not in skip and len(name_candidate) > 2:
+                    collected["name"] = name_candidate
+                    break
+        if "name" in collected:
+            break
+
+    # Fallback: use first non-greeting user message as name
+    if "name" not in collected:
+        user_msgs = [m.get("content", m.get("text", "")) for m in history if m.get("role") == "user"]
+        greetings = {"hi", "hello", "hey", "start", "begin", "yes", "ok", "sure", "ready"}
+        for msg in user_msgs:
+            cleaned = msg.strip()
+            if cleaned.lower() not in greetings and len(cleaned) > 2 and len(cleaned.split()) <= 6:
+                collected["name"] = cleaned
+                break
+
+    # ── Entity type
+    type_map = {
+        "startup": "startup", "msme": "msme", "proprietorship": "proprietorship",
+        "sole proprietor": "proprietorship", "partnership": "partnership",
+        "pvt ltd": "private_limited", "pvt. ltd": "private_limited",
+        "private limited": "private_limited", "public limited": "public_limited",
+        "llp": "llp", "limited liability": "llp", "ngo": "ngo",
+        "cooperative": "cooperative", "society": "cooperative",
+    }
+    for keyword, etype in type_map.items():
+        if keyword in all_lower:
+            collected["type"] = etype
+            break
+
+    # ── Sector
+    sector_map = {
+        "food processing": "food_processing", "food": "food_processing",
+        "pickle": "food_processing", "spice": "food_processing", "dairy": "food_processing",
+        "agriculture": "agriculture", "farming": "agriculture", "agri": "agriculture",
+        "organic farming": "agriculture", "crop": "agriculture",
+        "it": "it_tech", "tech": "it_tech", "software": "it_tech", "saas": "it_tech",
+        "app development": "it_tech", "ai": "it_tech", "fintech": "fintech",
+        "healthcare": "healthcare", "hospital": "healthcare", "pharma": "healthcare",
+        "medical": "healthcare", "biotech": "healthcare",
+        "manufacturing": "manufacturing", "factory": "manufacturing",
+        "textile": "textile", "garment": "textile", "fashion": "textile",
+        "handloom": "textile", "handicraft": "manufacturing",
+        "renewable": "renewable_energy", "solar": "renewable_energy",
+        "wind energy": "renewable_energy", "ev": "renewable_energy",
+        "education": "education", "edtech": "education", "school": "education",
+        "retail": "retail", "ecommerce": "retail", "e-commerce": "retail",
+        "logistics": "logistics", "transport": "logistics", "delivery": "logistics",
+        "export": "export", "import": "export",
+        "construction": "construction", "real estate": "construction",
+        "tourism": "tourism", "hotel": "tourism", "hospitality": "tourism",
+    }
+    for keyword, sector in sector_map.items():
+        if keyword in all_lower:
+            collected["sector"] = sector
+            break
+
+    # ── State & city
+    for state in _INDIAN_STATES:
+        if state in all_lower:
+            collected["state"] = state.title()
+            break
+
+    # Common city detection
+    cities = {
+        "mumbai": "Maharashtra", "pune": "Maharashtra", "nagpur": "Maharashtra",
+        "bangalore": "Karnataka", "bengaluru": "Karnataka", "mysore": "Karnataka",
+        "chennai": "Tamil Nadu", "coimbatore": "Tamil Nadu",
+        "hyderabad": "Telangana", "delhi": "Delhi", "new delhi": "Delhi",
+        "noida": "Uttar Pradesh", "gurgaon": "Haryana", "gurugram": "Haryana",
+        "ahmedabad": "Gujarat", "surat": "Gujarat", "jaipur": "Rajasthan",
+        "lucknow": "Uttar Pradesh", "kolkata": "West Bengal",
+        "kochi": "Kerala", "thiruvananthapuram": "Kerala",
+        "bhopal": "Madhya Pradesh", "indore": "Madhya Pradesh",
+        "chandigarh": "Chandigarh", "patna": "Bihar",
+    }
+    for city, state in cities.items():
+        if city in all_lower:
+            collected["city"] = city.title()
+            if "state" not in collected:
+                collected["state"] = state
+            break
+
+    # ── Team size (look for numbers near team/employee/people keywords)
+    team_patterns = [
+        r"(\d+)\s*(?:employees?|people|members?|team\s*(?:size)?|persons?|staff|workers?)",
+        r"(?:team|employees?|people|staff)\s*(?:of|:)?\s*(\d+)",
+        r"(?:we\s*(?:are|have))\s*(\d+)",
+    ]
+    for pat in team_patterns:
+        match = re.search(pat, all_lower)
+        if match:
+            collected["team_size"] = int(match.group(1))
+            break
+
+    # ── Revenue
+    revenue_patterns = [
+        r"(?:₹|rs\.?|inr)\s*([\d,]+)\s*(?:lakh|lac|l)\w*",
+        r"([\d,]+)\s*(?:lakh|lac|l)\w*",
+        r"(?:₹|rs\.?|inr)\s*([\d,]+)\s*(?:crore|cr)\w*",
+        r"([\d,]+)\s*(?:crore|cr)\w*",
+        r"(?:revenue|turnover|annual)\s*(?:is|of|:)?\s*(?:₹|rs\.?|inr)?\s*([\d,]+)",
+    ]
+    for pat in revenue_patterns:
+        match = re.search(pat, all_lower)
+        if match:
+            num_str = match.group(1).replace(",", "")
+            try:
+                val = int(num_str)
+                if "crore" in all_lower or "cr" in all_lower:
+                    val *= 10_000_000
+                elif "lakh" in all_lower or "lac" in all_lower:
+                    val *= 100_000
+                elif val < 1000:
+                    # Likely in lakhs if small number mentioned with revenue
+                    val *= 100_000
+                collected["revenue_inr"] = val
+            except ValueError:
+                pass
+            break
+
+    # ── Funding purpose
+    purpose_map = {
+        "technology upgrade": "technology_upgrade", "tech upgrade": "technology_upgrade",
+        "machinery": "technology_upgrade", "equipment": "technology_upgrade",
+        "working capital": "working_capital", "cash flow": "working_capital",
+        "expansion": "expansion", "scale up": "expansion", "grow": "expansion",
+        "new unit": "expansion", "new branch": "expansion",
+        "r&d": "r_and_d", "research": "r_and_d", "innovation": "r_and_d",
+        "export": "export_promotion", "international": "export_promotion",
+        "marketing": "marketing", "branding": "marketing",
+        "hiring": "hiring", "recruit": "hiring", "talent": "hiring",
+        "training": "skill_development", "skill": "skill_development",
+        "capex": "capex", "capital expenditure": "capex",
+    }
+    for keyword, purpose in purpose_map.items():
+        if keyword in all_lower:
+            collected["funding_purpose"] = purpose
+            break
+
+    return collected
+
+
+def _fallback_intake(body: ChatRequest) -> dict:
+    """
+    Smart conversational fallback when Gemini API is unavailable.
+    Parses ALL user messages to extract fields, acknowledges what was understood,
+    and asks natural follow-up questions for missing fields.
+    """
+    import re
+    import random
+
     history = body.history or []
     user_messages = [m for m in history if m.get("role") == "user"]
     step = len(user_messages)
 
-    if step < len(INTAKE_QUESTIONS):
-        q = INTAKE_QUESTIONS[step]
-        reply = f"{q['question']}\n\n{q['example']}"
+    # Parse everything the user has said so far
+    collected = _parse_fields_from_history(history, body.message)
+
+    # Count how many of the 6 required fields we have
+    required = ["name", "type", "sector", "state", "team_size", "revenue_inr"]
+    fields_done = sum(1 for f in required if f in collected)
+    # Also count funding_purpose as bonus field
+    if "funding_purpose" in collected:
+        fields_done = min(fields_done + 1, 6)
+
+    # ── Step 0: First message — warm greeting + ask for intro
+    if step == 0:
+        greetings = [
+            "Welcome! 🙏 I'd love to learn about your business so I can find the best government grants for you.\n\nTo get started — **tell me about your business**. What's the name, what do you do, and where are you based?\n\nFeel free to share as much or as little as you'd like!",
+            "Hi there! 👋 I'm here to help you discover government grants tailored to your business.\n\nLet's start with the basics — **what's your business called and what does it do?** For example: \"We're TechVista, a Pune-based SaaS startup building HR tools.\"",
+            "Great to have you here! 🚀 Let's find the right government schemes for your business.\n\n**Tell me a bit about your company** — the name, what industry you're in, and where you're located. I'll take it from there!",
+        ]
         return {
-            "reply": reply,
+            "reply": random.choice(greetings),
             "intake_complete": False,
-            "fields_collected": step,
-            "total_fields": len(INTAKE_QUESTIONS),
+            "fields_collected": 0,
+            "total_fields": 6,
         }
-    else:
-        # All questions answered — parse answers into profile
-        profile_data = {**MOCK_PROFILE, "session_id": body.session_id}
-        for i, msg in enumerate(user_messages):
-            if i < len(INTAKE_QUESTIONS):
-                field = INTAKE_QUESTIONS[i]["field"]
-                val = msg.get("content", msg.get("text", ""))
-                if field == "name":
-                    profile_data["name"] = val
-                elif field == "type":
-                    profile_data["type"] = val.lower().strip()
-                elif field == "sector":
-                    profile_data["sector"] = val.lower().strip()
-                elif field == "state":
-                    parts = val.split(",")
-                    profile_data["state"] = parts[0].strip()
-                    if len(parts) > 1:
-                        profile_data["city"] = parts[1].strip()
-                elif field == "team_size":
-                    nums = re.findall(r"\d+", val)
-                    if nums:
-                        profile_data["team_size"] = int(nums[0])
-                elif field == "revenue_and_purpose":
-                    nums = re.findall(r"[\d,]+", val.replace("\u20b9", ""))
-                    if nums:
-                        try:
-                            profile_data["revenue_inr"] = int(nums[0].replace(",", ""))
-                        except ValueError:
-                            pass
+
+    # ── Check if we have enough to complete
+    has_essentials = all(f in collected for f in ["name", "sector", "state"])
+    if fields_done >= 5 or (has_essentials and fields_done >= 4):
+        # Fill defaults for missing optional fields
+        collected.setdefault("type", "msme")
+        collected.setdefault("team_size", 10)
+        collected.setdefault("revenue_inr", 0)
+        collected.setdefault("funding_purpose", "general")
+        collected.setdefault("city", "")
+        collected["session_id"] = body.session_id
+
+        # Build confirmation message
+        name = collected.get("name", "your business")
+        location = f"{collected.get('city', '')}, {collected.get('state', '')}".strip(", ")
+        reply = (
+            f"Excellent! Here's what I've captured about **{name}**:\n\n"
+            f"• **Entity Type:** {collected.get('type', 'N/A').replace('_', ' ').title()}\n"
+            f"• **Sector:** {collected.get('sector', 'N/A').replace('_', ' ').title()}\n"
+            f"• **Location:** {location or 'India'}\n"
+            f"• **Team Size:** {collected.get('team_size', 'N/A')} people\n"
+            f"• **Annual Revenue:** ₹{collected.get('revenue_inr', 0):,}\n"
+            f"• **Funding Need:** {collected.get('funding_purpose', 'general').replace('_', ' ').title()}\n\n"
+            "🔍 Starting your personalized grant search now..."
+        )
 
         return {
-            "reply": (
-                "Perfect! I have everything I need. Here's what I captured:\n\n"
-                f"- **Business:** {profile_data['name']}\n"
-                f"- **Type:** {profile_data['type']}\n"
-                f"- **Sector:** {profile_data['sector']}\n"
-                f"- **Location:** {profile_data.get('city', '')}, {profile_data['state']}\n"
-                f"- **Team:** {profile_data['team_size']} people\n"
-                f"- **Revenue:** INR {profile_data['revenue_inr']:,}\n"
-                f"- **Purpose:** {profile_data.get('funding_purpose', 'general')}\n\n"
-                "Starting grant search now..."
-            ),
+            "reply": reply,
             "intake_complete": True,
-            "fields_collected": len(INTAKE_QUESTIONS),
-            "total_fields": len(INTAKE_QUESTIONS),
-            "profile": profile_data,
+            "fields_collected": 6,
+            "total_fields": 6,
+            "profile": collected,
         }
+
+    # ── Build dynamic follow-up based on what's missing
+    missing = [f for f in required if f not in collected]
+    ack_parts = []
+    ask_parts = []
+
+    # Acknowledge what we understood from the latest message
+    latest = body.message.strip()
+    if "name" in collected and step <= 2:
+        ack_parts.append(f"Got it — **{collected['name']}**")
+    if "sector" in collected and step <= 2:
+        ack_parts.append(f"in the **{collected['sector'].replace('_', ' ')}** space")
+    if "state" in collected and step <= 2:
+        loc = collected.get("city", "")
+        loc = f"{loc}, " if loc else ""
+        ack_parts.append(f"based in **{loc}{collected['state']}**")
+
+    # Build contextual questions for missing fields
+    if "name" in missing:
+        ask_parts.append("What's the name of your business or organisation?")
+
+    if "sector" in missing and "type" in missing:
+        ask_parts.append(
+            "What does your business do, and what kind of entity is it? "
+            "For example: \"We're a food processing startup\" or \"MSME in textiles\"."
+        )
+    elif "sector" in missing:
+        ask_parts.append(
+            "Which industry or sector are you in? "
+            "(e.g. Agriculture, IT, Manufacturing, Food Processing, Healthcare...)"
+        )
+    elif "type" in missing:
+        entity_q = [
+            "What type of entity is your business registered as? (Startup, MSME, Pvt Ltd, LLP, Proprietorship...)",
+            "And is your business registered as a Startup, MSME, Private Limited, or something else?",
+        ]
+        ask_parts.append(random.choice(entity_q))
+
+    if "state" in missing:
+        ask_parts.append("Which state (and city) is your business based in?")
+
+    if "team_size" in missing and "revenue_inr" in missing:
+        ask_parts.append(
+            "How large is your team, and what's your approximate annual revenue? "
+            "Also, what do you primarily need the funding for — expansion, equipment, working capital?"
+        )
+    elif "team_size" in missing:
+        ask_parts.append("How many people are currently on your team?")
+    elif "revenue_inr" in missing:
+        purpose_hint = ""
+        if "funding_purpose" not in collected:
+            purpose_hint = " And what would you use the grant funding for?"
+        ask_parts.append(
+            f"What's your approximate annual revenue (in ₹)?{purpose_hint}"
+        )
+
+    # Compose reply
+    ack = " ".join(ack_parts)
+    if ack:
+        ack = ack.rstrip(".") + ". "
+        # Vary the acknowledgement tone
+        openers = ["Nice! ", "Great! ", "Thanks! ", "Perfect! ", "Wonderful! ", ""]
+        ack = random.choice(openers) + ack
+
+    # Take at most 2 questions to avoid overwhelming
+    questions = "\n\n".join(ask_parts[:2])
+    reply = f"{ack}{questions}".strip()
+
+    return {
+        "reply": reply,
+        "intake_complete": False,
+        "fields_collected": fields_done,
+        "total_fields": 6,
+    }
 
 
 @router.post("/pipeline")
