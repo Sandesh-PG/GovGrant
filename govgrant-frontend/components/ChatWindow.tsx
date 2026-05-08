@@ -59,10 +59,13 @@ export function ChatWindow({ onIntakeComplete, onFieldsCollected, sessionId }: C
       });
 
       if (!response.ok) {
-        throw new Error('Chat request failed');
+        const errorBody = await response.text();
+        console.error(`[GovGrant] /api/chat failed — status: ${response.status}, body:`, errorBody);
+        throw new Error(`Chat request failed (${response.status}): ${errorBody.slice(0, 200)}`);
       }
 
       const data = await response.json();
+      console.log('[GovGrant] /api/chat response:', data);
 
       // Update fields collected count for progress bar
       if (onFieldsCollected && data.fields_collected !== undefined) {
@@ -79,9 +82,9 @@ export function ChatWindow({ onIntakeComplete, onFieldsCollected, sessionId }: C
         }, 2500);
       }
 
-    } catch (err) {
-      console.error(err);
-      setMessages(prev => [...prev, { role: 'bot', content: 'Sorry, I encountered an error. Please try again.' }]);
+    } catch (err: any) {
+      console.error('[GovGrant] Chat error:', err.message);
+      setMessages(prev => [...prev, { role: 'bot', content: `Sorry, something went wrong. Please try again.\n\nDetails: ${err.message}` }]);
     } finally {
       setIsTyping(false);
     }

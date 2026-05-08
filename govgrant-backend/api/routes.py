@@ -1,13 +1,15 @@
 """
 GovGrant API Routes — Auth, Sessions, Chat (SSE), Results, Alerts.
 
-Chat endpoint streams mock SSE events (2s delay each) so the frontend
-can be developed immediately. Real agent logic will be plugged in later.
+Chat endpoint uses real Gemini IntakeAgent for conversational intake.
+Pipeline endpoint runs Agent 2 (Research) with real Gemini search.
+Agents 3-4 still use mock data (to be wired later).
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from datetime import date, datetime, timedelta
 from typing import List, Optional
@@ -34,6 +36,21 @@ from db.models import (
     User,
     UserProfile,
 )
+from agents.research_service import run_research, read_profile_from_db
+from agents.intake_service import process_intake_message
+from agents.validator_service import run_validation
+from agents.planner_service import run_planner
+
+# ─── Logging setup ────────────────────────────────────────────────────────────
+import sys
+logger = logging.getLogger("govgrant.routes")
+_handler = logging.StreamHandler(stream=sys.stderr)
+_handler.setFormatter(logging.Formatter(
+    "%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+))
+logging.getLogger("govgrant").setLevel(logging.INFO)
+logging.getLogger("govgrant").addHandler(_handler)
 
 router = APIRouter(prefix="/api")
 
@@ -395,25 +412,75 @@ async def chat(
     db: Session = Depends(get_session),
 ):
     """
-    Conversational intake: returns a JSON reply with the next question.
-    After all 6 answers are collected, returns intake_complete = true
-    so the frontend can redirect to the /processing page.
+    Conversational intake powered by real Gemini 2.0 Flash.
+    Gemini asks natural questions to collect 6 business fields.
+    When complete, persists UserProfile to DB and returns intake_complete=true.
     """
+    logger.info("[%s] /chat called - message: %.80s", body.session_id, body.message)
     _verify_session_ownership(body.session_id, user, db)
 
-    # Count how many user messages are in the history (each = one answered question)
+    # Try real Gemini first, fall back to hardcoded questions if API fails
+    try:
+        result = await process_intake_message(
+            session_id=body.session_id,
+            message=body.message,
+            history=body.history or [],
+        )
+        logger.info("[%s] Gemini intake OK", body.session_id)
+    except Exception as e:
+        logger.warning("[%s] Gemini intake failed (%s), using fallback questions", body.session_id, str(e)[:120])
+        result = _fallback_intake(body)
+
+    # If intake is complete, persist the profile to DB
+    if result["intake_complete"] and result.get("profile"):
+        profile = result["profile"]
+        logger.info(
+            "[%s] Intake complete - persisting profile: name=%s, sector=%s, state=%s",
+            body.session_id, profile.get("name"), profile.get("sector"), profile.get("state"),
+        )
+
+        # Clear existing profile (idempotent re-runs)
+        existing = db.exec(
+            select(UserProfile).where(UserProfile.session_id == body.session_id)
+        ).first()
+        if existing:
+            db.delete(existing)
+            db.commit()
+
+        db.add(UserProfile(
+            session_id=body.session_id,
+            name=profile.get("name", ""),
+            type=profile.get("type", "other"),
+            sector=profile.get("sector", "other"),
+            state=profile.get("state", ""),
+            city=profile.get("city", ""),
+            team_size=profile.get("team_size", 1),
+            revenue_inr=profile.get("revenue_inr", 0),
+            funding_purpose=profile.get("funding_purpose", "general"),
+        ))
+
+        # Update session status
+        chat_session = db.get(ChatSession, body.session_id)
+        if chat_session:
+            chat_session.status = "researching"
+            db.add(chat_session)
+
+        db.commit()
+        logger.info("[%s] UserProfile persisted, status -> researching", body.session_id)
+
+    return result
+
+
+def _fallback_intake(body: ChatRequest) -> dict:
+    """Hardcoded question flow used when Gemini API is unavailable."""
+    import re
     history = body.history or []
     user_messages = [m for m in history if m.get("role") == "user"]
-    step = len(user_messages)  # 0-indexed: 0 means first question not yet answered
-
-    # If the user just sent a message, that's the answer to question[step-1]
-    # and the bot should ask question[step] next.
-    # But on the very first call (step=0, user just said "Ready" or similar),
-    # the bot should ask question 0.
+    step = len(user_messages)
 
     if step < len(INTAKE_QUESTIONS):
         q = INTAKE_QUESTIONS[step]
-        reply = f"{q['question']}\n\n💡 {q['example']}"
+        reply = f"{q['question']}\n\n{q['example']}"
         return {
             "reply": reply,
             "intake_complete": False,
@@ -421,19 +488,46 @@ async def chat(
             "total_fields": len(INTAKE_QUESTIONS),
         }
     else:
-        # All 6 questions answered — persist profile and signal completion
+        # All questions answered — parse answers into profile
         profile_data = {**MOCK_PROFILE, "session_id": body.session_id}
+        for i, msg in enumerate(user_messages):
+            if i < len(INTAKE_QUESTIONS):
+                field = INTAKE_QUESTIONS[i]["field"]
+                val = msg.get("content", msg.get("text", ""))
+                if field == "name":
+                    profile_data["name"] = val
+                elif field == "type":
+                    profile_data["type"] = val.lower().strip()
+                elif field == "sector":
+                    profile_data["sector"] = val.lower().strip()
+                elif field == "state":
+                    parts = val.split(",")
+                    profile_data["state"] = parts[0].strip()
+                    if len(parts) > 1:
+                        profile_data["city"] = parts[1].strip()
+                elif field == "team_size":
+                    nums = re.findall(r"\d+", val)
+                    if nums:
+                        profile_data["team_size"] = int(nums[0])
+                elif field == "revenue_and_purpose":
+                    nums = re.findall(r"[\d,]+", val.replace("\u20b9", ""))
+                    if nums:
+                        try:
+                            profile_data["revenue_inr"] = int(nums[0].replace(",", ""))
+                        except ValueError:
+                            pass
+
         return {
             "reply": (
-                "✅ Perfect! I have everything I need. Here's what I captured:\n\n"
-                f"• **Business:** {MOCK_PROFILE['name']}\n"
-                f"• **Type:** {MOCK_PROFILE['type']}\n"
-                f"• **Sector:** {MOCK_PROFILE['sector']}\n"
-                f"• **Location:** {MOCK_PROFILE['city']}, {MOCK_PROFILE['state']}\n"
-                f"• **Team:** {MOCK_PROFILE['team_size']} people\n"
-                f"• **Revenue:** ₹{MOCK_PROFILE['revenue_inr']:,}\n"
-                f"• **Purpose:** {MOCK_PROFILE['funding_purpose']}\n\n"
-                "🔍 Starting grant search now..."
+                "Perfect! I have everything I need. Here's what I captured:\n\n"
+                f"- **Business:** {profile_data['name']}\n"
+                f"- **Type:** {profile_data['type']}\n"
+                f"- **Sector:** {profile_data['sector']}\n"
+                f"- **Location:** {profile_data.get('city', '')}, {profile_data['state']}\n"
+                f"- **Team:** {profile_data['team_size']} people\n"
+                f"- **Revenue:** INR {profile_data['revenue_inr']:,}\n"
+                f"- **Purpose:** {profile_data.get('funding_purpose', 'general')}\n\n"
+                "Starting grant search now..."
             ),
             "intake_complete": True,
             "fields_collected": len(INTAKE_QUESTIONS),
@@ -448,60 +542,151 @@ async def run_pipeline(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ):
-    """SSE streaming endpoint — runs the 4-stage mock pipeline."""
+    """
+    SSE streaming endpoint — runs the 4-stage pipeline.
+    Stage 1 (intake): reads real profile from DB (persisted by /chat).
+    Stage 2 (research): runs real ResearchAgent (Gemini search).
+    Stages 3-4: still mock (to be wired later).
+    """
+    logger.info(
+        "🚀 [%s] ═══ PIPELINE START ═══",
+        body.session_id,
+    )
     chat_session = _verify_session_ownership(body.session_id, user, db)
 
     async def sse_stream():
-        # Clear existing mock data for this session to prevent IntegrityErrors on re-runs
-        db.exec(select(UserProfile).where(UserProfile.session_id == body.session_id)).all() # Force load
-        db.query(UserProfile).filter(UserProfile.session_id == body.session_id).delete()
+        # Clear existing data for stages 2-4 (profile is kept from /chat)
+        logger.info("[%s] Clearing previous pipeline data for re-run", body.session_id)
         db.query(RawScheme).filter(RawScheme.session_id == body.session_id).delete()
         db.query(RankedScheme).filter(RankedScheme.session_id == body.session_id).delete()
         db.query(GrantReport).filter(GrantReport.session_id == body.session_id).delete()
         db.commit()
 
         # ── Stage 1: Intake done ──────────────────────────────────────
-        await asyncio.sleep(2)
-        profile_data = {**MOCK_PROFILE, "session_id": body.session_id}
-        db.add(UserProfile(session_id=body.session_id, **MOCK_PROFILE))
+        # Profile was already persisted by /chat endpoint.
+        # Read it from DB to confirm and emit SSE event.
+        logger.info(
+            "📋 [%s] Stage 1: Reading profile from user_profiles table",
+            body.session_id,
+        )
+        profile_data = read_profile_from_db(body.session_id, db)
+
+        if not profile_data:
+            # Fallback: if no profile in DB, use mock
+            logger.warning(
+                "⚠️ [%s] No profile in DB — using MOCK_PROFILE fallback",
+                body.session_id,
+            )
+            profile_data = {**MOCK_PROFILE, "session_id": body.session_id}
+            db.add(UserProfile(session_id=body.session_id, **MOCK_PROFILE))
+            db.commit()
+
         chat_session.status = "researching"
         db.add(chat_session)
         db.commit()
+
+        logger.info(
+            "✅ [%s] Stage 1 DONE — intake_done fired. Profile: name=%s, sector=%s",
+            body.session_id,
+            profile_data.get("name"),
+            profile_data.get("sector"),
+        )
         yield f"event: intake_done\ndata: {json.dumps(profile_data)}\n\n"
 
-        # ── Stage 2: Research done ────────────────────────────────────
-        await asyncio.sleep(2)
-        for s in MOCK_SCHEMES:
-            scheme_data = s.copy()
-            if scheme_data.get("deadline"):
-                scheme_data["deadline"] = date.fromisoformat(scheme_data["deadline"])
-            db.add(RawScheme(session_id=body.session_id, **scheme_data))
-        db.commit()
-        yield f"event: research_done\ndata: {json.dumps(MOCK_SCHEMES)}\n\n"
+        # ── Stage 2: Research (REAL Agent 2) ───────────────────────────
+        logger.info(
+            "🔬 [%s] Stage 2: Starting ResearchAgent with profile JSON",
+            body.session_id,
+        )
+        try:
+            research_schemes = await run_research(
+                session_id=body.session_id,
+                profile_data=profile_data,
+                db=db,
+            )
+            logger.info(
+                "✅ [%s] Stage 2 DONE — research_done fired. %d schemes found",
+                body.session_id, len(research_schemes),
+            )
 
-        # ── Stage 3: Validation done ──────────────────────────────────
-        await asyncio.sleep(2)
+            # Format schemes for SSE payload
+            sse_schemes = []
+            for s in research_schemes:
+                sse_schemes.append({
+                    "scheme_name": s.get("name", s.get("scheme_name", "")),
+                    "source_url": s.get("portal_url", s.get("source_url", "")),
+                    "source_type": s.get("source", s.get("source_type", "web_search")),
+                    "criteria_text": s.get("description", s.get("criteria_text", "")),
+                    "deadline": s.get("deadline"),
+                    "max_revenue_inr": s.get("max_revenue_inr"),
+                    "eligible_types": json.dumps(
+                        s.get("eligible_entity_types", s.get("eligible_types", []))
+                    ),
+                })
+
+        except Exception as e:
+            logger.error(
+                "❌ [%s] Stage 2 FAILED: %s — falling back to mock schemes",
+                body.session_id, str(e), exc_info=True,
+            )
+            # Fallback to mock schemes
+            sse_schemes = MOCK_SCHEMES
+            for s in MOCK_SCHEMES:
+                scheme_data = s.copy()
+                if scheme_data.get("deadline"):
+                    scheme_data["deadline"] = date.fromisoformat(scheme_data["deadline"])
+                db.add(RawScheme(session_id=body.session_id, **scheme_data))
+            db.commit()
+
+        yield f"event: research_done\ndata: {json.dumps(sse_schemes)}\n\n"
+
+        # ── Stage 3: Validation (REAL Agent 3) ───────────────────────
+        logger.info("[%s] Stage 3: Starting ValidatorAgent", body.session_id)
+        try:
+            ranked_schemes = await run_validation(
+                session_id=body.session_id,
+                profile_data=profile_data,
+                db=db,
+            )
+            logger.info("[%s] Stage 3 DONE — %d schemes ranked", body.session_id, len(ranked_schemes))
+        except Exception as e:
+            logger.error("[%s] Stage 3 FAILED: %s — falling back to mock", body.session_id, str(e))
+            ranked_schemes = []
+            for r in MOCK_RANKED:
+                db.add(RankedScheme(session_id=body.session_id, **r))
+            db.commit()
+            ranked_schemes = MOCK_RANKED
+
         chat_session.status = "validating"
         db.add(chat_session)
-        for r in MOCK_RANKED:
-            db.add(RankedScheme(session_id=body.session_id, **r))
         db.commit()
-        yield f"event: validation_done\ndata: {json.dumps(MOCK_RANKED)}\n\n"
+        yield f"event: validation_done\ndata: {json.dumps(ranked_schemes)}\n\n"
 
-        # ── Stage 4: Report ready ─────────────────────────────────────
-        await asyncio.sleep(2)
-        chat_session.status = "done"
-        db.add(chat_session)
-        db.add(
-            GrantReport(
+        # ── Stage 4: Report (REAL Agent 4) ───────────────────────────
+        logger.info("[%s] Stage 4: Starting PlannerAgent", body.session_id)
+        try:
+            report = await run_planner(
+                session_id=body.session_id,
+                profile_data=profile_data,
+                db=db,
+            )
+            logger.info("[%s] Stage 4 DONE — report generated", body.session_id)
+        except Exception as e:
+            logger.error("[%s] Stage 4 FAILED: %s — falling back to mock", body.session_id, str(e))
+            report = MOCK_REPORT
+            db.add(GrantReport(
                 session_id=body.session_id,
                 documents_json=json.dumps(MOCK_REPORT["documents"]),
                 action_cards_json=json.dumps(MOCK_REPORT["action_cards"]),
                 cover_summary=MOCK_REPORT["cover_summary"],
-            )
-        )
+            ))
+            db.commit()
+
+        chat_session.status = "done"
+        db.add(chat_session)
         db.commit()
-        yield f"event: report_ready\ndata: {json.dumps(MOCK_REPORT)}\n\n"
+        logger.info("[%s] === PIPELINE COMPLETE ===", body.session_id)
+        yield f"event: report_ready\ndata: {json.dumps(report)}\n\n"
 
     return StreamingResponse(
         sse_stream(),

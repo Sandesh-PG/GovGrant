@@ -30,16 +30,16 @@ export default function ChatPage() {
 
     const initSession = async () => {
       try {
-        const storedId = localStorage.getItem('current_session_id');
-        if (storedId) {
-          setSessionId(storedId);
-        } else {
-          const { session_id } = await api.createSession();
-          localStorage.setItem('current_session_id', session_id);
-          setSessionId(session_id);
-        }
+        // Always create a fresh session when arriving at /chat
+        // A stale session_id in localStorage could belong to a different user → 403
+        const { session_id } = await api.createSession();
+        localStorage.setItem('current_session_id', session_id);
+        setSessionId(session_id);
       } catch (err) {
         console.error('Failed to create session', err);
+        // If session creation fails, redirect to login (token is likely expired)
+        localStorage.removeItem('auth_token');
+        router.push('/login');
       }
     };
 

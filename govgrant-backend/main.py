@@ -15,9 +15,9 @@ from db.database import create_db_and_tables
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_db_and_tables()
-    print("✅ Database tables created / verified")
+    print("[OK] Database tables created / verified")
     yield
-    print("🛑 GovGrant shutting down")
+    print("[STOP] GovGrant shutting down")
 
 
 app = FastAPI(
