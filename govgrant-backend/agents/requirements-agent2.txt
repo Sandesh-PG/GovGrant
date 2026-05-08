@@ -1,0 +1,15 @@
+# ── Add these to your existing requirements.txt ──────────────────────────────
+# Run: pip install -r requirements-agent2.txt
+# Then: playwright install chromium
+
+# Web scraping
+httpx==0.27.0
+beautifulsoup4==4.12.3
+lxml==5.2.1
+playwright==1.44.0
+
+# Vector store (already in project but ensure version)
+chromadb==0.5.3
+
+# Async support (already in FastAPI but pin)
+anyio==4.4.0

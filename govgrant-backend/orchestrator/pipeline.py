@@ -18,7 +18,7 @@ from google.genai import types
 
 from agents import (
     create_intake_agent,
-    create_research_agent,
+    research_agent,
     create_validator_agent,
     create_planner_agent,
 )
@@ -39,7 +39,7 @@ def create_pipeline() -> SequentialAgent:
         description="End-to-end grant discovery pipeline for Indian businesses.",
         sub_agents=[
             create_intake_agent(MODEL),
-            create_research_agent(MODEL),
+            research_agent,
             create_validator_agent(MODEL),
             create_planner_agent(MODEL),
         ],

@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { ChatWindow } from '@/components/ChatWindow';
-import { Shield, ChevronRight, Check } from 'lucide-react';
+import { Shield, ChevronRight, Check, ArrowLeft } from 'lucide-react';
 import { cn } from '@/components/StatusBadge';
 import { api } from '@/lib/api';
 
@@ -64,9 +64,20 @@ export default function ChatPage() {
     <div className="min-h-screen bg-slate-50 flex flex-col">
       {/* Header */}
       <header className="px-6 py-4 bg-white border-b border-slate-100 flex items-center justify-between sticky top-0 z-10">
-        <div className="flex items-center space-x-2">
-          <Shield className="text-blue-600 w-5 h-5" />
-          <span className="font-outfit font-bold text-lg text-slate-900">GovGrant</span>
+        <div className="flex items-center space-x-4">
+          <button
+            onClick={() => router.push('/')}
+            className="flex items-center text-sm font-semibold text-slate-500 hover:text-blue-600 transition-colors px-2.5 py-1.5 rounded-xl hover:bg-slate-50 group"
+            id="chat-back-button"
+          >
+            <ArrowLeft size={16} className="mr-1.5 group-hover:-translate-x-0.5 transition-transform" />
+            Home
+          </button>
+          <div className="w-px h-6 bg-slate-200" />
+          <div className="flex items-center space-x-2">
+            <Shield className="text-blue-600 w-5 h-5" />
+            <span className="font-outfit font-bold text-lg text-slate-900">GovGrant</span>
+          </div>
         </div>
         
         <div className="flex items-center space-x-4">
