@@ -452,6 +452,14 @@ async def run_pipeline(
     chat_session = _verify_session_ownership(body.session_id, user, db)
 
     async def sse_stream():
+        # Clear existing mock data for this session to prevent IntegrityErrors on re-runs
+        db.exec(select(UserProfile).where(UserProfile.session_id == body.session_id)).all() # Force load
+        db.query(UserProfile).filter(UserProfile.session_id == body.session_id).delete()
+        db.query(RawScheme).filter(RawScheme.session_id == body.session_id).delete()
+        db.query(RankedScheme).filter(RankedScheme.session_id == body.session_id).delete()
+        db.query(GrantReport).filter(GrantReport.session_id == body.session_id).delete()
+        db.commit()
+
         # ── Stage 1: Intake done ──────────────────────────────────────
         await asyncio.sleep(2)
         profile_data = {**MOCK_PROFILE, "session_id": body.session_id}
@@ -464,7 +472,10 @@ async def run_pipeline(
         # ── Stage 2: Research done ────────────────────────────────────
         await asyncio.sleep(2)
         for s in MOCK_SCHEMES:
-            db.add(RawScheme(session_id=body.session_id, **s))
+            scheme_data = s.copy()
+            if scheme_data.get("deadline"):
+                scheme_data["deadline"] = date.fromisoformat(scheme_data["deadline"])
+            db.add(RawScheme(session_id=body.session_id, **scheme_data))
         db.commit()
         yield f"event: research_done\ndata: {json.dumps(MOCK_SCHEMES)}\n\n"
 

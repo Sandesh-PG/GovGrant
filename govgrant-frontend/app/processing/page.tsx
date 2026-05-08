@@ -55,11 +55,13 @@ export default function ProcessingPage() {
           const lines = buffer.split('\n\n');
           buffer = lines.pop() || '';
 
-          for (const line of lines) {
-            if (line.startsWith('event: ')) {
-              const eventType = line.split('event: ')[1].split('\n')[0];
-              const dataLine = lines[lines.indexOf(line) + 1] || '';
-              const dataStr = dataLine.replace('data: ', '');
+          for (const block of lines) {
+            if (block.includes('event: ')) {
+              const eventType = block.split('event: ')[1].split('\n')[0].trim();
+              const dataMatch = block.match(/data: (.*)/);
+              const dataStr = dataMatch ? dataMatch[1] : '';
+              
+              if (!dataStr) continue;
               const data = JSON.parse(dataStr);
 
               if (eventType === 'research_done') {
