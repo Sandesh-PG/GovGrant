@@ -503,7 +503,7 @@ export function ChatWindow({ onIntakeComplete, onFieldsCollected, sessionId }: C
               onKeyDown={e => e.key === 'Enter' && sendMessage(textInput)}
               placeholder="Type your answer…"
               disabled={isLoading}
-              className="w-full px-4 py-3 pr-12 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all text-sm disabled:opacity-50"
+              className="w-full px-4 py-3 pr-12 text-black rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all text-sm disabled:opacity-50"
             />
             <button
               id="chat-send-button"

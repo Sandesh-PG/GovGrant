@@ -70,6 +70,8 @@ Return ONLY a valid JSON array. Each element must have these fields:
   "eligible_types": ["startup", "msme", "private_limited", ...],
   "grant_amount": "e.g. Up to ₹10 lakh or null",
   "portal_url": "Direct application URL if found else null",
+  "required_documents": ["list", "of", "docs", "if", "found", "else", "[]"],
+  "application_steps": ["step 1", "step 2", "if", "found", "else", "[]"],
   "source_type": "live"
 }
 

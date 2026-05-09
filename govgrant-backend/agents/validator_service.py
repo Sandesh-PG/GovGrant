@@ -89,7 +89,8 @@ async def run_validation(
         ranked = _fallback_rank(filtered)
 
     # Ensure unique scheme names and backfill to top-5 if needed
-    ranked = _dedupe_and_fill(ranked, filtered, target_count=5)
+    # We pass both the 'filtered' and the 'raw_schemes' to ensure we hit 5 matches
+    ranked = _dedupe_and_fill(ranked, filtered + raw_schemes, target_count=5)
     ranked = _reindex_ranks(ranked)
 
     # Fill generic reasons with scheme-specific details
@@ -105,7 +106,16 @@ async def run_validation(
     if existing:
         db.commit()
 
+    # Get all raw schemes for this session to map back deep details
+    raw_schemes_list = db.exec(
+        select(RawScheme).where(RawScheme.session_id == session_id)
+    ).all()
+    raw_map = {s.scheme_name.lower().strip(): s for s in raw_schemes_list}
+
     for r in ranked:
+        name_key = r["scheme_name"].lower().strip()
+        s = raw_map.get(name_key)
+        
         db.add(RankedScheme(
             session_id=session_id,
             scheme_name=r["scheme_name"],
@@ -115,8 +125,10 @@ async def run_validation(
             urgency_score=r.get("urgency_score", 0.5),
             composite_rank=r["composite_rank"],
             portal_url=r.get("portal_url", ""),
-            deadline=r.get("deadline"),
-            grant_amount=r.get("grant_amount"),
+            deadline=r.get("deadline") or (str(s.deadline) if s and s.deadline else None),
+            grant_amount=r.get("grant_amount") or "Check portal",
+            documents_json=s.documents_json if s else None,
+            steps_json=s.steps_json if s else None,
         ))
 
     db.commit()

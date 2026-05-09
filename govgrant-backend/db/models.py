@@ -94,6 +94,8 @@ class RawScheme(SQLModel, table=True):
     deadline: Optional[date] = None
     max_revenue_inr: Optional[int] = None
     eligible_types: str  # JSON array stored as string
+    documents_json: Optional[str] = None # New: stores scraped document requirements
+    steps_json: Optional[str] = None    # New: stores scraped application steps
     created_at: datetime = Field(default_factory=_now)
 
 
@@ -113,6 +115,8 @@ class RankedScheme(SQLModel, table=True):
     portal_url: Optional[str] = None
     deadline: Optional[str] = None
     grant_amount: Optional[str] = None
+    documents_json: Optional[str] = None
+    steps_json: Optional[str] = None
     created_at: datetime = Field(default_factory=_now)
 
 
