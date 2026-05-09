@@ -50,6 +50,11 @@ export type DocumentItem = {
   mandatory: boolean;
 };
 
+export type SchemeDocuments = {
+  scheme_name: string;
+  documents: DocumentItem[];
+};
+
 export type ActionCard = {
   scheme_name: string;
   portal_url: string;
@@ -63,6 +68,7 @@ export type GrantReport = {
   session_id: string;
   schemes: RankedScheme[];
   documents: DocumentItem[];
+  documents_by_scheme?: SchemeDocuments[];
   action_cards: ActionCard[];
   cover_summary: string;
   created_at: string;

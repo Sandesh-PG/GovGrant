@@ -29,8 +29,10 @@ from core.security import (
 from db.database import get_session
 from db.models import (
     Alert,
+    ChatMessage,
     ChatSession,
     GrantReport,
+    IntakeProfile,
     RankedScheme,
     RawScheme,
     User,
@@ -53,6 +55,19 @@ logging.getLogger("govgrant").setLevel(logging.INFO)
 logging.getLogger("govgrant").addHandler(_handler)
 
 router = APIRouter(prefix="/api")
+
+OPENING_MESSAGE = json.dumps({
+    "step": 1,
+    "message": (
+        "Hello! Welcome. I'm your Government Funding Intake Assistant. I'm here to help you "
+        "identify and apply for central and state government funding schemes that best fit your business.\n\n"
+        "This will just take a few minutes. Could you please share your full name and the name of your business or organisation?"
+    ),
+    "input_type": "text",
+    "options": [],
+    "field": "name_and_org",
+    "collected": {},
+})
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Request / Response schemas
@@ -330,6 +345,13 @@ def create_session(
     db.add(session)
     db.commit()
     db.refresh(session)
+    # Store opening message for this session
+    db.add(ChatMessage(
+        session_id=session.session_id,
+        role="assistant",
+        content=OPENING_MESSAGE,
+    ))
+    db.commit()
     return {"session_id": session.session_id}
 
 
@@ -401,6 +423,35 @@ def _verify_session_ownership(
     return chat
 
 
+def _read_chat_history(session_id: str, db: Session) -> List[dict]:
+    """Return full chat history for a session in chronological order."""
+    rows = db.exec(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == session_id)
+        .order_by(ChatMessage.created_at, ChatMessage.id)
+    ).all()
+
+    history = []
+    for row in rows:
+        history.append({
+            "role": row.role,
+            "content": row.content,
+        })
+    return history
+
+
+def _store_chat_message(session_id: str, role: str, content: str, db: Session) -> None:
+    """Persist a chat message for a session."""
+    if not content or not content.strip():
+        return
+    db.add(ChatMessage(
+        session_id=session_id,
+        role=role,
+        content=content.strip(),
+    ))
+    db.commit()
+
+
 @router.post("/chat")
 async def chat(
     body: ChatRequest,
@@ -415,17 +466,27 @@ async def chat(
     logger.info("[%s] /chat called - message: %.80s", body.session_id, body.message)
     _verify_session_ownership(body.session_id, user, db)
 
+    # Use full stored history for context
+    history = _read_chat_history(body.session_id, db)
+
+    # Store the incoming user message immediately
+    _store_chat_message(body.session_id, "user", body.message, db)
+
     # Try real Gemini first, fall back to smart conversational flow if API fails
     try:
         result = await process_intake_message(
             session_id=body.session_id,
             message=body.message,
-            history=body.history or [],
+            history=history,
         )
         logger.info("[%s] Gemini intake OK", body.session_id)
     except Exception as e:
         logger.warning("[%s] Gemini intake failed (%s), using conversational fallback", body.session_id, str(e)[:120])
-        result = _fallback_intake(body)
+        result = _fallback_intake(history, body.message, body.session_id)
+
+    # Store assistant reply for continuity
+    if result.get("reply"):
+        _store_chat_message(body.session_id, "assistant", result["reply"], db)
 
     # If intake is complete, persist the profile to DB
     if result["intake_complete"] and result.get("profile"):
@@ -445,14 +506,20 @@ async def chat(
 
         db.add(UserProfile(
             session_id=body.session_id,
-            name=profile.get("name", ""),
-            type=profile.get("type", "other"),
+            name=profile.get("name") or profile.get("business_name", ""),
+            type=profile.get("type") or profile.get("registration_type", "other"),
             sector=profile.get("sector", "other"),
             state=profile.get("state", ""),
             city=profile.get("city", ""),
             team_size=profile.get("team_size", 1),
             revenue_inr=profile.get("revenue_inr", 0),
             funding_purpose=profile.get("funding_purpose", "general"),
+        ))
+
+        # Persist full intake profile JSON
+        db.add(IntakeProfile(
+            session_id=body.session_id,
+            profile_json=json.dumps(profile),
         ))
 
         # Update session status
@@ -511,6 +578,27 @@ def _parse_fields_from_history(history: list, current_message: str) -> dict:
             if cleaned.lower() not in greetings and len(cleaned) > 2 and len(cleaned.split()) <= 6:
                 collected["name"] = cleaned
                 break
+
+    # ── Full name and business name from "Name, Business" pattern
+    if "full_name" not in collected or "name" not in collected:
+        for msg_text in [current_message] + [m.get("content", m.get("text", "")) for m in history if m.get("role") == "user"]:
+            if "," in msg_text:
+                parts = [p.strip() for p in msg_text.split(",") if p.strip()]
+                if len(parts) >= 2:
+                    collected.setdefault("full_name", parts[0])
+                    collected.setdefault("name", parts[1])
+                    break
+
+    # Explicit full name and business name patterns
+    if "full_name" not in collected:
+        match = _re.search(r"(?:my name is|i am|i'm)\s+([A-Za-z][A-Za-z\s.'-]{2,})", current_message, _re.IGNORECASE)
+        if match:
+            collected["full_name"] = match.group(1).strip().rstrip(".,")
+
+    if "name" not in collected:
+        match = _re.search(r"(?:business|company|startup|organisation|organization)\s+name\s+(?:is|:)?\s*([A-Za-z0-9][A-Za-z0-9\s&.'-]{2,})", current_message, _re.IGNORECASE)
+        if match:
+            collected["name"] = match.group(1).strip().rstrip(".,")
 
     # ── Entity type
     type_map = {
@@ -636,10 +724,121 @@ def _parse_fields_from_history(history: list, current_message: str) -> dict:
             collected["funding_purpose"] = purpose
             break
 
+    # ── Business stage
+    stage_map = {
+        "idea": "Idea / Pre-revenue",
+        "pre-revenue": "Idea / Pre-revenue",
+        "early stage": "Early stage (under 1 year)",
+        "under 1 year": "Early stage (under 1 year)",
+        "growth stage": "Growth stage (1-3 years)",
+        "1-3 years": "Growth stage (1-3 years)",
+        "1–3 years": "Growth stage (1-3 years)",
+        "established": "Established (3+ years)",
+        "3+ years": "Established (3+ years)",
+    }
+    for keyword, stage in stage_map.items():
+        if keyword in all_lower:
+            collected["business_stage"] = stage
+            break
+
+    # ── Annual turnover (range label + numeric)
+    turnover_map = [
+        ("not yet generating revenue", "Not yet generating revenue", 0),
+        ("pre-revenue", "Not yet generating revenue", 0),
+        ("under 10 lakh", "Under ₹10 lakhs", 900000),
+        ("under ₹10", "Under ₹10 lakhs", 900000),
+        ("10-50", "₹10–₹50 lakhs", 3000000),
+        ("10–50", "₹10–₹50 lakhs", 3000000),
+        ("50 lakhs", "₹50 lakhs–₹1 crore", 7500000),
+        ("1 crore", "Above ₹1 crore", 15000000),
+        ("above 1 crore", "Above ₹1 crore", 15000000),
+    ]
+    if "annual_turnover" not in collected:
+        for keyword, label, value in turnover_map:
+            if keyword in all_lower:
+                collected["annual_turnover"] = label
+                collected.setdefault("revenue_inr", value)
+                break
+
+    # ── Employee count (range label + numeric)
+    employee_map = [
+        ("just myself", "Just myself (solo)", 1),
+        ("solo", "Just myself (solo)", 1),
+        ("2-10", "2–10", 6),
+        ("2–10", "2–10", 6),
+        ("11-50", "11–50", 30),
+        ("11–50", "11–50", 30),
+        ("51-200", "51–200", 125),
+        ("51–200", "51–200", 125),
+        ("200+", "200+", 250),
+    ]
+    if "employee_count" not in collected:
+        for keyword, label, value in employee_map:
+            if keyword in all_lower:
+                collected["employee_count"] = label
+                collected.setdefault("team_size", value)
+                break
+
+    # ── Funding type
+    funding_type_map = {
+        "grant": "Grant (non-repayable)",
+        "subsidised loan": "Subsidised loan",
+        "subsidized loan": "Subsidised loan",
+        "equity": "Equity / Seed funding",
+        "seed": "Equity / Seed funding",
+        "tax benefits": "Tax benefits / exemptions",
+        "exemptions": "Tax benefits / exemptions",
+        "infrastructure": "Infrastructure support",
+        "not sure": "Not sure — show me options",
+    }
+    if "funding_type" not in collected:
+        for keyword, label in funding_type_map.items():
+            if keyword in all_lower:
+                collected["funding_type"] = label
+                break
+
+    # ── Registration type (also map to entity type)
+    registration_map = {
+        "sole proprietorship": ("Sole proprietorship", "proprietorship"),
+        "proprietorship": ("Sole proprietorship", "proprietorship"),
+        "partnership": ("Partnership / LLP", "partnership"),
+        "llp": ("Partnership / LLP", "llp"),
+        "private limited": ("Private Limited", "private_limited"),
+        "pvt ltd": ("Private Limited", "private_limited"),
+        "public limited": ("Public Limited", "public_limited"),
+        "ngo": ("NGO / Trust / Society", "ngo"),
+        "trust": ("NGO / Trust / Society", "ngo"),
+        "society": ("NGO / Trust / Society", "ngo"),
+        "not yet registered": ("Not yet registered", "other"),
+    }
+    if "registration_type" not in collected:
+        for keyword, (label, entity) in registration_map.items():
+            if keyword in all_lower:
+                collected["registration_type"] = label
+                collected.setdefault("type", entity)
+                break
+
+    # ── Certifications
+    certification_map = {
+        "udyam": "Udyam / MSME registration",
+        "msme": "Udyam / MSME registration",
+        "dpiit": "DPIIT Startup recognition",
+        "startup india": "DPIIT Startup recognition",
+        "iso": "ISO certification",
+        "fssai": "FSSAI / BIS / other regulatory",
+        "bis": "FSSAI / BIS / other regulatory",
+        "none": "None of the above",
+    }
+    if "certifications" not in collected:
+        for keyword, label in certification_map.items():
+            if keyword in all_lower:
+                collected["certifications"] = label
+                break
+
     return collected
 
 
-def _fallback_intake(body: ChatRequest) -> dict:
+def _fallback_intake(history: List[dict], current_message: str, session_id: str) -> dict:
     """
     Smart conversational fallback when Gemini API is unavailable.
     Parses ALL user messages to extract fields, acknowledges what was understood,
@@ -648,139 +847,256 @@ def _fallback_intake(body: ChatRequest) -> dict:
     import re
     import random
 
-    history = body.history or []
     user_messages = [m for m in history if m.get("role") == "user"]
-    step = len(user_messages)
+    step = len(user_messages) + (1 if current_message.strip() else 0)
 
     # Parse everything the user has said so far
-    collected = _parse_fields_from_history(history, body.message)
+    collected = _parse_fields_from_history(history, current_message)
 
-    # Count how many of the 6 required fields we have
-    required = ["name", "type", "sector", "state", "team_size", "revenue_inr"]
-    fields_done = sum(1 for f in required if f in collected)
-    # Also count funding_purpose as bonus field
-    if "funding_purpose" in collected:
-        fields_done = min(fields_done + 1, 6)
+    # Required fields (no defaults allowed)
+    required_fields = [
+        "full_name",
+        "name",
+        "state",
+        "sector",
+        "business_stage",
+        "annual_turnover",
+        "employee_count",
+        "funding_type",
+        "funding_purpose",
+        "registration_type",
+        "certifications",
+        "team_size",
+        "revenue_inr",
+        "type",
+    ]
 
-    # ── Step 0: First message — warm greeting + ask for intro
-    if step == 0:
-        greetings = [
-            "Welcome! 🙏 I'd love to learn about your business so I can find the best government grants for you.\n\nTo get started — **tell me about your business**. What's the name, what do you do, and where are you based?\n\nFeel free to share as much or as little as you'd like!",
-            "Hi there! 👋 I'm here to help you discover government grants tailored to your business.\n\nLet's start with the basics — **what's your business called and what does it do?** For example: \"We're TechVista, a Pune-based SaaS startup building HR tools.\"",
-            "Great to have you here! 🚀 Let's find the right government schemes for your business.\n\n**Tell me a bit about your company** — the name, what industry you're in, and where you're located. I'll take it from there!",
-        ]
+    has_all_required = all(f in collected for f in required_fields)
+
+    # Progress count (6 steps for UI)
+    step_keys = [
+        ["full_name", "name"],
+        ["state"],
+        ["sector"],
+        ["business_stage", "annual_turnover"],
+        ["employee_count", "funding_type"],
+        ["funding_purpose", "registration_type", "certifications"],
+    ]
+    fields_done = 0
+    for keys in step_keys:
+        if all(k in collected for k in keys):
+            fields_done += 1
+
+    # Opening message if needed
+    if not any(m.get("role") == "assistant" for m in history):
+        opening_ar = {
+            "step": 1,
+            "message": (
+                "Hello! Welcome. I'm your Government Funding Intake Assistant. I'm here to help you "
+                "identify and apply for central and state government funding schemes that best fit your business.\n\n"
+                "This will just take a few minutes. Could you please share your full name and the name of your business or organisation?"
+            ),
+            "input_type": "text",
+            "options": [],
+            "field": "name_and_org",
+            "collected": {},
+        }
         return {
-            "reply": random.choice(greetings),
+            "reply": opening_ar["message"],
             "intake_complete": False,
             "fields_collected": 0,
-            "total_fields": 6,
+            "total_fields": 10,
+            "agent_response": opening_ar,
+        }
+
+    # Clarify Udyam/DPIIT if user seems confused
+    msg_lower = current_message.lower()
+    if "udyam" in msg_lower and "what" in msg_lower:
+        ar = {"step": 10, "message": "Udyam is the government portal for MSME registration. Could you confirm if you have Udyam / MSME registration?", "input_type": "confirm", "options": ["Yes, I have Udyam", "No, I don't"], "field": "certifications", "collected": collected}
+        return {
+            "reply": ar["message"],
+            "intake_complete": False,
+            "fields_collected": min(fields_done, 10),
+            "total_fields": 10,
+            "agent_response": ar,
+        }
+    if "dpiit" in msg_lower and "what" in msg_lower:
+        ar = {"step": 10, "message": "DPIIT recognition is for startups under the Startup India programme. Do you have DPIIT Startup recognition?", "input_type": "confirm", "options": ["Yes, I have DPIIT", "No, I don't"], "field": "certifications", "collected": collected}
+        return {
+            "reply": ar["message"],
+            "intake_complete": False,
+            "fields_collected": min(fields_done, 10),
+            "total_fields": 10,
+            "agent_response": ar,
         }
 
     # ── Check if we have enough to complete
-    has_essentials = all(f in collected for f in ["name", "sector", "state"])
-    if fields_done >= 5 or (has_essentials and fields_done >= 4):
-        # Fill defaults for missing optional fields
-        collected.setdefault("type", "msme")
-        collected.setdefault("team_size", 10)
-        collected.setdefault("revenue_inr", 0)
-        collected.setdefault("funding_purpose", "general")
+    if has_all_required:
         collected.setdefault("city", "")
-        collected["session_id"] = body.session_id
+        collected["session_id"] = session_id
 
-        # Build confirmation message
-        name = collected.get("name", "your business")
-        location = f"{collected.get('city', '')}, {collected.get('state', '')}".strip(", ")
-        reply = (
-            f"Excellent! Here's what I've captured about **{name}**:\n\n"
-            f"• **Entity Type:** {collected.get('type', 'N/A').replace('_', ' ').title()}\n"
-            f"• **Sector:** {collected.get('sector', 'N/A').replace('_', ' ').title()}\n"
-            f"• **Location:** {location or 'India'}\n"
-            f"• **Team Size:** {collected.get('team_size', 'N/A')} people\n"
-            f"• **Annual Revenue:** ₹{collected.get('revenue_inr', 0):,}\n"
-            f"• **Funding Need:** {collected.get('funding_purpose', 'general').replace('_', ' ').title()}\n\n"
-            "🔍 Starting your personalized grant search now..."
+        summary_msg = (
+            "Thanks! I've collected all the information I need. Here's a summary of your profile:\n\n"
+            f"• **Name & Organisation:** {collected.get('full_name', '')} — {collected.get('name', '')}\n"
+            f"• **State:** {collected.get('state', '')}\n"
+            f"• **Sector:** {collected.get('sector', '')}\n"
+            f"• **Business Stage:** {collected.get('business_stage', '')}\n"
+            f"• **Annual Turnover:** {collected.get('annual_turnover', '')}\n"
+            f"• **Employees:** {collected.get('employee_count', '')}\n"
+            f"• **Funding Type:** {collected.get('funding_type', '')}\n"
+            f"• **Purpose of Funding:** {collected.get('funding_purpose', '')}\n"
+            f"• **Registration Type:** {collected.get('registration_type', '')}\n"
+            f"• **Certifications:** {collected.get('certifications', '')}\n\n"
+            "Shall I proceed with identifying the government funding schemes you may be eligible for?"
         )
-
+        summary_ar = {
+            "step": "summary",
+            "message": summary_msg,
+            "input_type": "confirm",
+            "options": ["Yes, show me eligible schemes", "I want to edit my answers"],
+            "field": "confirmation",
+            "collected": {
+                "name_and_org": f"{collected.get('full_name', '')}, {collected.get('name', '')}",
+                "state": collected.get("state", ""),
+                "sector": collected.get("sector", ""),
+                "business_stage": collected.get("business_stage", ""),
+                "annual_turnover": collected.get("annual_turnover", ""),
+                "employee_count": collected.get("employee_count", ""),
+                "funding_type": collected.get("funding_type", ""),
+                "funding_purpose": collected.get("funding_purpose", ""),
+                "legal_registration": collected.get("registration_type", ""),
+                "certifications": collected.get("certifications", ""),
+            },
+        }
         return {
-            "reply": reply,
+            "reply": summary_msg,
             "intake_complete": True,
-            "fields_collected": 6,
-            "total_fields": 6,
+            "fields_collected": 10,
+            "total_fields": 10,
             "profile": collected,
+            "agent_response": summary_ar,
         }
 
-    # ── Build dynamic follow-up based on what's missing
-    missing = [f for f in required if f not in collected]
-    ack_parts = []
-    ask_parts = []
+    # Determine next missing step in order
+    steps = [
+        {
+            "keys": ["full_name", "name"],
+            "step_num": 1,
+            "field": "name_and_org",
+            "question": "Could you please share your full name and the name of your business or organisation?",
+            "input_type": "text",
+            "options": [],
+        },
+        {
+            "keys": ["state"],
+            "step_num": 2,
+            "field": "state",
+            "question": "Which state is your business primarily operating from? This helps us identify both central and state-level schemes applicable to you.",
+            "input_type": "options",
+            "options": ["Karnataka", "Maharashtra", "Tamil Nadu", "Delhi", "Telangana", "Gujarat", "Punjab", "Rajasthan", "Uttar Pradesh", "Kerala", "Other"],
+        },
+        {
+            "keys": ["sector"],
+            "step_num": 3,
+            "field": "sector",
+            "question": "What is the primary sector of your business?",
+            "input_type": "options",
+            "options": ["Agritech / Agriculture", "Manufacturing", "IT / Software", "Healthcare", "Clean Energy", "Retail / Commerce", "Education / Edtech", "Other"],
+        },
+        {
+            "keys": ["business_stage"],
+            "step_num": 4,
+            "field": "business_stage",
+            "question": "What is the current stage of your business?",
+            "input_type": "options",
+            "options": ["Idea / Pre-revenue", "Early stage (< 1 year)", "Growth stage (1–3 years)", "Established (3+ years)"],
+        },
+        {
+            "keys": ["annual_turnover"],
+            "step_num": 5,
+            "field": "annual_turnover",
+            "question": "What is your approximate annual turnover? This matters for schemes like PMEGP and MSME subsidies.",
+            "input_type": "options",
+            "options": ["Not yet generating revenue", "Under ₹10 lakhs", "₹10–₹50 lakhs", "₹50 lakhs–₹1 crore", "Above ₹1 crore"],
+        },
+        {
+            "keys": ["employee_count"],
+            "step_num": 6,
+            "field": "employee_count",
+            "question": "How many employees does your organisation currently have?",
+            "input_type": "options",
+            "options": ["Just myself (solo)", "2\u201310", "11\u201350", "51\u2013200", "200+"],
+        },
+        {
+            "keys": ["funding_type"],
+            "step_num": 7,
+            "field": "funding_type",
+            "question": "What type of funding are you looking for?",
+            "input_type": "options",
+            "options": ["Grant (non-repayable)", "Subsidised loan", "Equity / Seed funding", "Tax benefits / exemptions", "Infrastructure support", "Not sure \u2014 show me options"],
+        },
+        {
+            "keys": ["funding_purpose"],
+            "step_num": 8,
+            "field": "funding_purpose",
+            "question": "What is the primary purpose of the funding you're seeking?",
+            "input_type": "options",
+            "options": ["Research & development", "Equipment / machinery", "Working capital", "Export promotion", "Hiring & training", "Digital transformation", "Other"],
+        },
+        {
+            "keys": ["registration_type"],
+            "step_num": 9,
+            "field": "legal_registration",
+            "question": "Are you a registered entity? If so, what type?",
+            "input_type": "options",
+            "options": ["Sole proprietorship", "Partnership / LLP", "Private Limited", "Public Limited", "NGO / Trust / Society", "Not yet registered"],
+        },
+        {
+            "keys": ["certifications"],
+            "step_num": 10,
+            "field": "certifications",
+            "question": "Do you hold any existing certifications relevant to funding? (Udyam = MSME registration; DPIIT = Startup India recognition)",
+            "input_type": "options",
+            "options": ["Udyam / MSME registration", "DPIIT Startup recognition", "ISO certification", "FSSAI / BIS / other regulatory", "None of the above"],
+        },
+    ]
 
-    # Acknowledge what we understood from the latest message
-    latest = body.message.strip()
-    if "name" in collected and step <= 2:
-        ack_parts.append(f"Got it — **{collected['name']}**")
-    if "sector" in collected and step <= 2:
-        ack_parts.append(f"in the **{collected['sector'].replace('_', ' ')}** space")
-    if "state" in collected and step <= 2:
-        loc = collected.get("city", "")
-        loc = f"{loc}, " if loc else ""
-        ack_parts.append(f"based in **{loc}{collected['state']}**")
+    next_step_def = None
+    for step_def in steps:
+        if not all(k in collected for k in step_def["keys"]):
+            next_step_def = step_def
+            break
 
-    # Build contextual questions for missing fields
-    if "name" in missing:
-        ask_parts.append("What's the name of your business or organisation?")
+    ack_choices = ["Got it!", "Thanks for sharing that.", "Perfect.", "Great."]
+    ack = random.choice(ack_choices) if current_message.strip() else ""
 
-    if "sector" in missing and "type" in missing:
-        ask_parts.append(
-            "What does your business do, and what kind of entity is it? "
-            "For example: \"We're a food processing startup\" or \"MSME in textiles\"."
-        )
-    elif "sector" in missing:
-        ask_parts.append(
-            "Which industry or sector are you in? "
-            "(e.g. Agriculture, IT, Manufacturing, Food Processing, Healthcare...)"
-        )
-    elif "type" in missing:
-        entity_q = [
-            "What type of entity is your business registered as? (Startup, MSME, Pvt Ltd, LLP, Proprietorship...)",
-            "And is your business registered as a Startup, MSME, Private Limited, or something else?",
-        ]
-        ask_parts.append(random.choice(entity_q))
-
-    if "state" in missing:
-        ask_parts.append("Which state (and city) is your business based in?")
-
-    if "team_size" in missing and "revenue_inr" in missing:
-        ask_parts.append(
-            "How large is your team, and what's your approximate annual revenue? "
-            "Also, what do you primarily need the funding for — expansion, equipment, working capital?"
-        )
-    elif "team_size" in missing:
-        ask_parts.append("How many people are currently on your team?")
-    elif "revenue_inr" in missing:
-        purpose_hint = ""
-        if "funding_purpose" not in collected:
-            purpose_hint = " And what would you use the grant funding for?"
-        ask_parts.append(
-            f"What's your approximate annual revenue (in ₹)?{purpose_hint}"
-        )
-
-    # Compose reply
-    ack = " ".join(ack_parts)
-    if ack:
-        ack = ack.rstrip(".") + ". "
-        # Vary the acknowledgement tone
-        openers = ["Nice! ", "Great! ", "Thanks! ", "Perfect! ", "Wonderful! ", ""]
-        ack = random.choice(openers) + ack
-
-    # Take at most 2 questions to avoid overwhelming
-    questions = "\n\n".join(ask_parts[:2])
-    reply = f"{ack}{questions}".strip()
+    if next_step_def:
+        reply = f"{ack} {next_step_def['question']}".strip()
+        ar = {
+            "step": next_step_def["step_num"],
+            "message": reply,
+            "input_type": next_step_def["input_type"],
+            "options": next_step_def["options"],
+            "field": next_step_def["field"],
+            "collected": collected,
+        }
+    else:
+        reply = ack
+        ar = {
+            "step": fields_done,
+            "message": reply,
+            "input_type": "text",
+            "options": [],
+            "field": "",
+            "collected": collected,
+        }
 
     return {
         "reply": reply,
         "intake_complete": False,
-        "fields_collected": fields_done,
-        "total_fields": 6,
+        "fields_collected": min(fields_done, 10),
+        "total_fields": 10,
+        "agent_response": ar,
     }
 
 
@@ -968,6 +1284,21 @@ def get_results(
         .order_by(RankedScheme.composite_rank)
     ).all()
 
+    documents_raw = json.loads(report.documents_json)
+    documents_by_scheme = []
+    documents = []
+
+    if (
+        isinstance(documents_raw, list)
+        and documents_raw
+        and isinstance(documents_raw[0], dict)
+        and "scheme_name" in documents_raw[0]
+    ):
+        documents_by_scheme = documents_raw
+        documents = _merge_documents_by_scheme(documents_by_scheme)
+    elif isinstance(documents_raw, list):
+        documents = documents_raw
+
     return {
         "session_id": session_id,
         "schemes": [
@@ -984,11 +1315,41 @@ def get_results(
             }
             for r in ranked
         ],
-        "documents": json.loads(report.documents_json),
+        "documents": documents,
+        "documents_by_scheme": documents_by_scheme,
         "action_cards": json.loads(report.action_cards_json),
         "cover_summary": report.cover_summary,
         "created_at": report.created_at.isoformat(),
     }
+
+
+def _merge_documents_by_scheme(documents_by_scheme: List[dict]) -> List[dict]:
+    """Merge per-scheme documents into a single deduped list."""
+    merged: dict[str, dict] = {}
+    for entry in documents_by_scheme:
+        if not isinstance(entry, dict):
+            continue
+        for doc in entry.get("documents", []):
+            if not isinstance(doc, dict):
+                continue
+            name = (doc.get("name") or "").strip()
+            if not name:
+                continue
+            key = " ".join(name.lower().split())
+            if key not in merged:
+                merged[key] = {
+                    "name": name,
+                    "mandatory": bool(doc.get("mandatory", False)),
+                    "description": (doc.get("description") or "").strip(),
+                }
+            else:
+                existing = merged[key]
+                if doc.get("mandatory"):
+                    existing["mandatory"] = True
+                if len(doc.get("description", "")) > len(existing.get("description", "")):
+                    existing["description"] = doc.get("description", "")
+
+    return list(merged.values())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

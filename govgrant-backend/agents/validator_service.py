@@ -88,6 +88,13 @@ async def run_validation(
         logger.warning("[%s] Gemini scoring returned nothing, using fallback ranking", session_id)
         ranked = _fallback_rank(filtered)
 
+    # Ensure unique scheme names and backfill to top-5 if needed
+    ranked = _dedupe_and_fill(ranked, filtered, target_count=5)
+    ranked = _reindex_ranks(ranked)
+
+    # Fill generic reasons with scheme-specific details
+    ranked = _enrich_ranked_reasons(ranked, filtered, raw_schemes, profile_data)
+
     # ── Step 4: Persist to ranked_schemes table ────────────────────────
     # Clear existing (idempotent re-runs)
     existing = db.exec(
@@ -259,6 +266,165 @@ def _parse_json_array(text: str) -> List[Dict]:
         except json.JSONDecodeError:
             pass
     return []
+
+
+def _normalize_scheme_name(name: str) -> str:
+    name = (name or "").strip().lower()
+    return re.sub(r"\s+", " ", name)
+
+
+def _is_generic_reason(reason: str) -> bool:
+    if not reason:
+        return True
+    text = reason.strip().lower()
+    if len(text) < 20:
+        return True
+    if "matches business profile" in text:
+        return True
+    return False
+
+
+def _build_reason(scheme: Dict[str, Any], profile: Dict[str, Any]) -> str:
+    """Create a concise, scheme-specific reason string."""
+    parts = []
+
+    entity_type = (profile.get("type") or profile.get("entity_type") or "").strip().lower()
+    sector = (profile.get("sector") or "").replace("_", " ").strip()
+    revenue = profile.get("revenue_inr") or 0
+
+    eligible_raw = scheme.get("eligible_types", "[]")
+    try:
+        eligible_types = json.loads(eligible_raw) if isinstance(eligible_raw, str) else eligible_raw
+    except (json.JSONDecodeError, TypeError):
+        eligible_types = []
+
+    eligible_types = [e.lower().strip() for e in eligible_types if isinstance(e, str)]
+
+    if entity_type and (not eligible_types or entity_type in eligible_types):
+        parts.append(f"Eligible for {entity_type.replace('_', ' ')} entities")
+
+    if sector:
+        parts.append(f"Sector match: {sector}")
+
+    max_rev = scheme.get("max_revenue_inr")
+    if max_rev:
+        parts.append(f"Revenue cap up to Rs {int(max_rev):,}")
+    elif revenue:
+        parts.append(f"Revenue considered: Rs {int(revenue):,}")
+
+    grant_amount = scheme.get("grant_amount")
+    if grant_amount:
+        parts.append(f"Grant: {grant_amount}")
+
+    criteria = (scheme.get("criteria_text") or "").strip()
+    if criteria:
+        snippet = criteria.replace("\n", " ").strip()
+        if len(snippet) > 140:
+            snippet = snippet[:137].rstrip() + "..."
+        parts.append(f"Criteria: {snippet}")
+
+    if not parts:
+        return "Eligible based on profile and scheme criteria."
+
+    # Keep it to two short sentences
+    first = "; ".join(parts[:3])
+    second = parts[3] if len(parts) > 3 else ""
+    if second:
+        return f"{first}. {second}"
+    return f"{first}."
+
+
+def _enrich_ranked_reasons(
+    ranked: List[Dict[str, Any]],
+    filtered: List[Dict[str, Any]],
+    raw_schemes: List[Dict[str, Any]],
+    profile: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Replace generic reasons with scheme-specific context."""
+    filtered_map = {
+        _normalize_scheme_name(s.get("scheme_name")): s for s in filtered
+    }
+    raw_map = {
+        _normalize_scheme_name(s.get("scheme_name")): s for s in raw_schemes
+    }
+
+    for r in ranked:
+        reason = r.get("reason", "")
+        if not _is_generic_reason(reason):
+            continue
+        name_key = _normalize_scheme_name(r.get("scheme_name"))
+        scheme = filtered_map.get(name_key) or raw_map.get(name_key) or {}
+        r["reason"] = _build_reason(scheme, profile)
+
+    return ranked
+
+
+def _normalize_scheme_name(name: str) -> str:
+    """Normalize scheme names for deduplication."""
+    name = (name or "").strip().lower()
+    return re.sub(r"\s+", " ", name)
+
+
+def _dedupe_and_fill(
+    ranked: List[Dict],
+    fallback_pool: List[Dict],
+    target_count: int = 5,
+) -> List[Dict]:
+    """
+    Remove duplicate scheme names and backfill with unique schemes
+    from the fallback pool to reach target_count.
+    """
+    seen: set[str] = set()
+    unique: List[Dict] = []
+
+    for item in ranked:
+        name = _normalize_scheme_name(item.get("scheme_name"))
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        unique.append(item)
+
+    if len(unique) >= target_count:
+        return unique[:target_count]
+
+    min_score = min((int(r.get("match_score", 50)) for r in unique), default=50)
+    next_score = max(0, min_score - 5)
+
+    for s in fallback_pool:
+        if len(unique) >= target_count:
+            break
+        name = _normalize_scheme_name(s.get("scheme_name"))
+        if not name or name in seen:
+            continue
+        unique.append({
+            "scheme_name": s.get("scheme_name"),
+            "match_score": int(next_score),
+            "rank": 0,
+            "reason": "Matches business profile based on sector and eligibility criteria.",
+            "urgency_score": 0.5,
+            "composite_rank": 0,
+            "portal_url": s.get("source_url", ""),
+            "deadline": s.get("deadline"),
+            "grant_amount": "Check portal for details",
+        })
+        seen.add(name)
+        next_score = max(0, next_score - 5)
+
+    return unique
+
+
+def _reindex_ranks(ranked: List[Dict]) -> List[Dict]:
+    """Normalize rank fields and clamp scores for UI safety."""
+    for i, r in enumerate(ranked):
+        r["rank"] = i + 1
+        r["composite_rank"] = i + 1
+        r["match_score"] = max(0, min(100, int(r.get("match_score", 50))))
+        r["urgency_score"] = max(0.0, min(1.0, float(r.get("urgency_score", 0.5))))
+        r.setdefault("reason", "Matches business profile based on sector and eligibility criteria.")
+        r.setdefault("portal_url", "")
+        r.setdefault("deadline", None)
+        r.setdefault("grant_amount", "Check portal for details")
+    return ranked
 
 
 def _fallback_rank(schemes: List[Dict]) -> List[Dict]:
