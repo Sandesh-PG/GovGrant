@@ -1,4 +1,4 @@
-"""SQLModel table definitions for all 7 GovGrant database tables."""
+"""SQLModel table definitions for all 9 GovGrant database tables."""
 from __future__ import annotations
 
 import uuid
@@ -39,7 +39,30 @@ class ChatSession(SQLModel, table=True):
     status: str = Field(default="intake")  # intake | researching | validating | done
 
 
-# ─── Table 3: user_profiles ───────────────────────────────────────────────────
+# ─── Table 3: chat_messages ───────────────────────────────────────────────────
+
+class ChatMessage(SQLModel, table=True):
+    __tablename__ = "chat_messages"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: str = Field(foreign_key="sessions.session_id", index=True)
+    role: str  # user | assistant
+    content: str
+    created_at: datetime = Field(default_factory=_now)
+
+
+# ─── Table 4: intake_profiles ───────────────────────────────────────────────
+
+class IntakeProfile(SQLModel, table=True):
+    __tablename__ = "intake_profiles"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: str = Field(foreign_key="sessions.session_id", index=True)
+    profile_json: str
+    created_at: datetime = Field(default_factory=_now)
+
+
+# ─── Table 5: user_profiles ───────────────────────────────────────────────────
 
 class UserProfile(SQLModel, table=True):
     __tablename__ = "user_profiles"
@@ -57,7 +80,7 @@ class UserProfile(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_now)
 
 
-# ─── Table 4: raw_schemes ─────────────────────────────────────────────────────
+# ─── Table 6: raw_schemes ─────────────────────────────────────────────────────
 
 class RawScheme(SQLModel, table=True):
     __tablename__ = "raw_schemes"
@@ -74,7 +97,7 @@ class RawScheme(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_now)
 
 
-# ─── Table 5: ranked_schemes ──────────────────────────────────────────────────
+# ─── Table 7: ranked_schemes ──────────────────────────────────────────────────
 
 class RankedScheme(SQLModel, table=True):
     __tablename__ = "ranked_schemes"
@@ -93,7 +116,7 @@ class RankedScheme(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_now)
 
 
-# ─── Table 6: grant_reports ───────────────────────────────────────────────────
+# ─── Table 8: grant_reports ───────────────────────────────────────────────────
 
 class GrantReport(SQLModel, table=True):
     __tablename__ = "grant_reports"
@@ -106,7 +129,7 @@ class GrantReport(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_now)
 
 
-# ─── Table 7: alerts ──────────────────────────────────────────────────────────
+# ─── Table 9: alerts ──────────────────────────────────────────────────────────
 
 class Alert(SQLModel, table=True):
     __tablename__ = "alerts"

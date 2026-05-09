@@ -8,12 +8,16 @@ import { cn } from '@/components/StatusBadge';
 import { api } from '@/lib/api';
 
 const PROGRESS_FIELDS = [
-  'Business name',
-  'Entity type',
-  'Sector',
+  'Name & Org',
   'State',
-  'Team size',
-  'Revenue'
+  'Sector',
+  'Stage',
+  'Turnover',
+  'Employees',
+  'Funding type',
+  'Purpose',
+  'Registration',
+  'Certifications',
 ];
 
 export default function ChatPage() {
@@ -47,7 +51,7 @@ export default function ChatPage() {
   }, [router]);
 
   const handleIntakeComplete = (profile: any) => {
-    setFieldsCollected(6);
+    setFieldsCollected(10);
     localStorage.setItem('current_session_id', sessionId!);
     setTimeout(() => {
       router.push('/processing');
@@ -98,7 +102,7 @@ export default function ChatPage() {
           <div className="w-32 md:w-48 h-2 bg-slate-100 rounded-full overflow-hidden">
             <div 
               className="h-full bg-blue-600 transition-all duration-500 ease-out" 
-              style={{ width: `${(fieldsCollected / 6) * 100}%` }}
+              style={{ width: `${(fieldsCollected / 10) * 100}%` }}
             />
           </div>
         </div>

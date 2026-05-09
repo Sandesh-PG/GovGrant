@@ -13,6 +13,7 @@ export default function ResultsPage({ params }: { params: Promise<{ session_id: 
   const { session_id } = use(params);
   const [report, setReport] = useState<GrantReport | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [expandedCard, setExpandedCard] = useState<string | null>(null);
   const router = useRouter();
 
   useEffect(() => {
@@ -125,36 +126,99 @@ export default function ResultsPage({ params }: { params: Promise<{ session_id: 
 
           {/* Right Column: Docs & Summary */}
           <div className="space-y-8">
-            <Checklist documents={report.documents} />
+            <Checklist
+              documents={report.documents}
+              documentsByScheme={report.documents_by_scheme}
+            />
             
             <div className="bg-white border border-slate-100 rounded-2xl p-6 shadow-sm">
               <h3 className="text-lg font-bold text-slate-900 mb-6 flex items-center">
                 Action Cards
               </h3>
               <div className="space-y-6">
-                {report.action_cards.map((card, i) => (
-                  <div key={i} className="space-y-3 pb-6 border-b border-slate-50 last:border-0 last:pb-0">
-                    <div className="flex items-start justify-between">
-                      <h4 className="text-sm font-bold text-slate-800">{card.scheme_name}</h4>
-                      <span className="text-[10px] bg-blue-50 text-blue-600 px-2 py-0.5 rounded font-bold uppercase tracking-wider">
-                        {card.estimated_days} Days Est.
-                      </span>
-                    </div>
-                    <ul className="space-y-2">
-                      {card.steps.slice(0, 3).map((step, si) => (
-                        <li key={si} className="flex items-start text-xs text-slate-500">
-                          <CheckCircle2 size={12} className="text-green-500 mr-2 flex-shrink-0 mt-0.5" />
-                          {step}
-                        </li>
-                      ))}
-                      {card.steps.length > 3 && (
-                        <li className="text-[10px] text-blue-500 font-bold pl-5">
-                          + {card.steps.length - 3} more steps in dashboard
-                        </li>
+                {report.action_cards.map((card, i) => {
+                  const cardKey = `${card.scheme_name}-${i}`;
+                  const isOpen = expandedCard === cardKey;
+                  return (
+                    <div key={cardKey} className="space-y-3 pb-6 border-b border-slate-50 last:border-0 last:pb-0">
+                      <div className="flex items-start justify-between">
+                        <div className="space-y-1">
+                          <h4 className="text-sm font-bold text-slate-800">{card.scheme_name}</h4>
+                          {card.deadline && (
+                            <p className="text-xs text-slate-500">Deadline: {card.deadline}</p>
+                          )}
+                        </div>
+                        <span className="text-[10px] bg-blue-50 text-blue-600 px-2 py-0.5 rounded font-bold uppercase tracking-wider">
+                          {card.estimated_days} Days Est.
+                        </span>
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <button
+                          onClick={() => setExpandedCard(isOpen ? null : cardKey)}
+                          className="text-xs font-bold text-blue-600 hover:text-blue-700"
+                        >
+                          {isOpen ? 'Hide roadmap' : 'View roadmap'}
+                        </button>
+                        {card.portal_url && (
+                          <a
+                            href={card.portal_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs font-semibold text-slate-600 hover:text-blue-600 inline-flex items-center"
+                          >
+                            Apply on portal
+                            <ExternalLink size={12} className="ml-1" />
+                          </a>
+                        )}
+                      </div>
+
+                      {isOpen ? (
+                        <div className="space-y-4">
+                          <div>
+                            <p className="text-xs font-bold text-slate-700 uppercase tracking-wider mb-2">
+                              Roadmap
+                            </p>
+                            <ol className="space-y-2 list-decimal list-inside text-xs text-slate-600">
+                              {card.steps.map((step, si) => (
+                                <li key={si}>{step}</li>
+                              ))}
+                            </ol>
+                          </div>
+                          {card.tips && card.tips.length > 0 && (
+                            <div>
+                              <p className="text-xs font-bold text-slate-700 uppercase tracking-wider mb-2">
+                                Tips
+                              </p>
+                              <ul className="space-y-2 text-xs text-slate-600">
+                                {card.tips.map((tip, ti) => (
+                                  <li key={ti} className="flex items-start">
+                                    <CheckCircle2 size={12} className="text-green-500 mr-2 flex-shrink-0 mt-0.5" />
+                                    {tip}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <ul className="space-y-2">
+                          {card.steps.slice(0, 3).map((step, si) => (
+                            <li key={si} className="flex items-start text-xs text-slate-500">
+                              <CheckCircle2 size={12} className="text-green-500 mr-2 flex-shrink-0 mt-0.5" />
+                              {step}
+                            </li>
+                          ))}
+                          {card.steps.length > 3 && (
+                            <li className="text-[10px] text-blue-500 font-bold pl-5">
+                              + {card.steps.length - 3} more steps in roadmap
+                            </li>
+                          )}
+                        </ul>
                       )}
-                    </ul>
-                  </div>
-                ))}
+                    </div>
+                  );
+                })}
               </div>
             </div>
 
