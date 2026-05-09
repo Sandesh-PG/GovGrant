@@ -263,6 +263,8 @@ def _persist_raw_schemes(schemes: list[dict], session_id: str) -> list[dict]:
                 deadline=deadline,
                 max_revenue_inr=revenue,
                 eligible_types=eligible_json,
+                documents_json=json.dumps(s.get("required_documents", [])),
+                steps_json=json.dumps(s.get("application_steps", [])),
             )
             db.add(record)
             persisted.append(s)
